@@ -62,7 +62,7 @@ if [[ -d "$MAILDIR" ]]; then
   echo "[skip] maildir/ already extracted."
 elif [[ -f "$TARBALL" ]]; then
   echo "[2/4] Extracting tarball …"
-  tar -xzf "$TARBALL" -C "$DATA_DIR/"
+  tar --no-same-owner -xzf "$TARBALL" -C "$DATA_DIR/"
   echo "      Done: $MAILDIR"
 else
   echo "ERROR: No tarball found at $TARBALL and maildir/ does not exist."
