@@ -128,13 +128,11 @@ class PrototypicalHead(BaseHead):
                 prof["centroid"] = (
                     prof["centroid"] * old_k + embs.sum(dim=0)
                 ) / new_k
-                # Recompute spread only from the incoming batch against the updated
-                # centroid (not a full recomputation — approximation is acceptable).
-                all_embs = embs
-                sims = F.cosine_similarity(
-                    all_embs, prof["centroid"].unsqueeze(0)
-                )
-                prof["spread"] = float((1.0 - sims).mean())
+                # Update spread as a running weighted average across all batches,
+                # matching the centroid update so both reflect the same email set.
+                sims = F.cosine_similarity(embs, prof["centroid"].unsqueeze(0))
+                batch_spread = float((1.0 - sims).mean())
+                prof["spread"] = (prof["spread"] * old_k + batch_spread * len(idx)) / new_k
                 prof["k"] = new_k
 
     def score(

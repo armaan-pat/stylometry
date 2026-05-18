@@ -395,11 +395,16 @@ def parse_args() -> argparse.Namespace:
     # Preprocessing flags — each maps to a PreprocessingConfig field
     p.add_argument("--strip-quoted",      action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--strip-signatures",  action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--strip-boilerplate", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--entity-masking",    action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--fix-encoding",      action=argparse.BooleanOptionalAction, default=True,
                    help="Run ftfy to fix garbled encoding artifacts.")
     p.add_argument("--min-body-chars",    type=int, default=50,
                    help="Drop emails with fewer than this many characters after cleaning.")
+    p.add_argument("--min-body-words",    type=int, default=20,
+                   help="Drop emails with fewer than this many whitespace-split tokens after cleaning.")
+    p.add_argument("--min-alnum-ratio",   type=float, default=0.60,
+                   help="Drop emails where less than this fraction of characters are alphanumeric or space.")
     p.add_argument("--max-body-chars",    type=int, default=4000,
                    help="Truncate email bodies to this many characters.")
     p.add_argument("--dry-run", action="store_true",
@@ -421,9 +426,12 @@ def main() -> None:
     config = PreprocessingConfig(
         strip_quoted=args.strip_quoted,
         strip_signatures=args.strip_signatures,
+        strip_boilerplate=args.strip_boilerplate,
         entity_masking=args.entity_masking,
         fix_encoding=args.fix_encoding,
         min_body_chars=args.min_body_chars,
+        min_body_words=args.min_body_words,
+        min_alnum_ratio=args.min_alnum_ratio,
         max_body_chars=args.max_body_chars,
     )
 

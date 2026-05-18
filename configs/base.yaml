@@ -28,9 +28,12 @@ data:
   preprocessing:
     strip_quoted: true
     strip_signatures: true
+    strip_boilerplate: true
     entity_masking: false
     fix_encoding: true
     min_body_chars: 50
+    min_body_words: 20
+    min_alnum_ratio: 0.60
     max_body_chars: 4000
 
 training:

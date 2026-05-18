@@ -63,9 +63,12 @@ class PreprocessingConfig(BaseModel):
 
     strip_quoted: bool = True
     strip_signatures: bool = True
+    strip_boilerplate: bool = True
     entity_masking: bool = False
     fix_encoding: bool = True          # run ftfy to fix garbled unicode/encoding artifacts
     min_body_chars: int = 50           # drop emails shorter than this after cleaning
+    min_body_words: int = 20           # drop emails with fewer than this many whitespace-split tokens
+    min_alnum_ratio: float = 0.60      # drop emails where <60% of chars are alphanumeric or space
     max_body_chars: int = 4000         # truncate bodies longer than this
 
 

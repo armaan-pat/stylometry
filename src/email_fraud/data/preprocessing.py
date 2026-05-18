@@ -97,6 +97,39 @@ _RE_SIG_SEPARATOR = re.compile(
     re.DOTALL,
 )
 
+# Corporate disclaimer / boilerplate anchors.
+# Applied in order; each strips from the match point to end-of-string.
+# Covers the dominant patterns in Enron and similar enterprise corpora.
+_BOILERPLATE_ANCHORS: list[re.Pattern] = [
+    # All-caps legal headers: "CONFIDENTIALITY NOTICE", "DISCLAIMER:", "NOTICE:", etc.
+    re.compile(
+        r"\n[ \t]*(?:CONFIDENTIALITY|PRIVILEGE[D]?|IMPORTANT|LEGAL)\s+(?:NOTICE|DISCLAIMER|STATEMENT)\b.*",
+        re.IGNORECASE | re.DOTALL,
+    ),
+    re.compile(r"\n[ \t]*(?:NOTICE|DISCLAIMER)\s*:.*", re.DOTALL),
+    # "This e-mail/message/communication [and any attachments] is/may ..."
+    re.compile(
+        r"\n[ \t]*This\s+(?:e-?mail|message|email|communication|transmission)"
+        r"(?:\s+and\s+any\s+attachments?)?\s+(?:is\s+(?:intended|confidential|privileged|for\s+the\s+use)|may\s+(?:be|contain)).*",
+        re.IGNORECASE | re.DOTALL,
+    ),
+    # "The information/contents contained in this e-mail/message ..."
+    re.compile(
+        r"\n[ \t]*The\s+(?:information|contents?)\s+(?:contained\s+in|of)\s+this\s+(?:e-?mail|message|email|communication).*",
+        re.IGNORECASE | re.DOTALL,
+    ),
+    # "If you (have) received this e-mail/message in error ..."
+    re.compile(
+        r"\n[ \t]*If\s+you\s+(?:have\s+)?received\s+this\s+(?:e-?mail|message|email|communication|transmission).*",
+        re.IGNORECASE | re.DOTALL,
+    ),
+    # "intended only for the (individual|person|named|use of)"
+    re.compile(
+        r"\n[ \t]*(?:is\s+)?[Ii]ntended\s+only\s+for\s+the\s+(?:individual|person|named|use).*",
+        re.DOTALL,
+    ),
+]
+
 # Order matters: broad patterns run first so fine-grained ones don't partially match.
 _REPLY_STRIP_PATTERNS: list[re.Pattern] = [
     _RE_FORWARD_BLOCK,
@@ -184,6 +217,13 @@ def _strip_signatures(body: str) -> str:
     return _RE_SIG_SEPARATOR.sub("", body)
 
 
+def _strip_boilerplate(body: str) -> str:
+    """Remove corporate disclaimer/boilerplate blocks."""
+    for pattern in _BOILERPLATE_ANCHORS:
+        body = pattern.sub("", body)
+    return body
+
+
 def _normalize_whitespace(text: str) -> str:
     text = _RE_WHITESPACE.sub(" ", text)
     text = _RE_BLANK_LINES.sub("\n\n", text)
@@ -197,20 +237,31 @@ def _normalize_high_variance(text: str) -> str:
     return text
 
 
-def _is_usable(body: str, min_chars: int) -> bool:
-    """Return True if the body meets length and placeholder-ratio thresholds.
+def _is_usable(body: str, min_chars: int, min_words: int, min_alnum_ratio: float) -> bool:
+    """Return True if the body passes all quality gates.
 
-    If >50% of tokens are placeholders after entity masking, the email's
-    content has been mostly stripped and is no longer useful for stylometry.
+    Checks (in order):
+    1. Minimum character count — catches near-empty bodies.
+    2. Minimum word count — catches symbol-only or stub bodies that clear the
+       char threshold (e.g. a long delimiter row, a one-liner stripped of context).
+    3. Placeholder ratio — catches emails that are mostly entity tokens after
+       masking (only meaningful when entity_masking=True; harmless when off).
+    4. Alphanumeric ratio — catches delimiter rows, ASCII tables, and other
+       structural noise where natural prose characters are the minority.
     """
     stripped = body.strip()
     if len(stripped) < min_chars:
         return False
     words = stripped.split()
-    if not words:
+    if len(words) < min_words:
         return False
     token_ratio = len(_RE_PLACEHOLDER.findall(stripped)) / len(words)
-    return token_ratio < 0.5
+    if token_ratio >= 0.5:
+        return False
+    alnum_and_space = sum(c.isalnum() or c == " " for c in stripped)
+    if alnum_and_space / len(stripped) < min_alnum_ratio:
+        return False
+    return True
 
 
 def clean_email_raw(raw: str, config: PreprocessingConfig) -> Optional[str]:
@@ -234,14 +285,17 @@ def preprocess(text: str, config: PreprocessingConfig) -> Optional[str]:
     """Apply the configured cleaning steps to an already-extracted email body.
 
     Steps (each gated by a config flag): strip_quoted, strip_signatures,
-    entity_masking. Whitespace normalization and truncation always run.
-    Returns None if the result is too short or over-normalized.
+    strip_boilerplate, entity_masking. Whitespace normalization and truncation
+    always run. Returns None if the result fails any _is_usable check.
     """
     if config.strip_quoted:
         text = _isolate_newest_message(text)
 
     if config.strip_signatures:
         text = _strip_signatures(text)
+
+    if config.strip_boilerplate:
+        text = _strip_boilerplate(text)
 
     if config.entity_masking:
         text = _normalize_high_variance(text)
@@ -251,7 +305,7 @@ def preprocess(text: str, config: PreprocessingConfig) -> Optional[str]:
     if config.max_body_chars and len(text) > config.max_body_chars:
         text = text[:config.max_body_chars]
 
-    if not _is_usable(text, config.min_body_chars):
+    if not _is_usable(text, config.min_body_chars, config.min_body_words, config.min_alnum_ratio):
         return None
 
     return text
