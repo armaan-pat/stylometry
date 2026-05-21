@@ -84,7 +84,7 @@ PAN Author Verification evaluation metrics. All metrics take:
 | `compute_eer(labels, scores)` | float | Equal Error Rate — where FAR == FRR |
 | `compute_c_at_1(labels, scores, threshold)` | float | PAN 2011 — rewards abstaining over guessing wrong |
 | `compute_f05u(labels, scores, threshold)` | float | PAN 2019 — precision-weighted F with abstain penalty |
-| `compute_pan_metrics(labels, scores)` | dict | All four metrics in one call |
+| `compute_verification_metrics(labels, scores)` | dict | All four metrics in one call |
 
 #### EER
 
@@ -118,5 +118,5 @@ scripts/evaluate.py
              for (email, true_sender) in test_set:
                  result = pipeline.score(email, claimed_sender)
                  # compare result.score against ground truth label
-             compute_pan_metrics(labels, scores)
+             compute_verification_metrics(labels, scores)
 ```

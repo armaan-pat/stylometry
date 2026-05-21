@@ -80,6 +80,7 @@ class CentroidProbe:
         seed: int = 0,
     ) -> None:
         self.confidence_tiers = confidence_tiers
+        self._seed = seed
         rng = random.Random(seed)
 
         sender_to_texts: dict[str, list[str]] = defaultdict(list)
@@ -209,7 +210,7 @@ class CentroidProbe:
         # Other-sender impostors: score each impostor email against a *random*
         # profiled sender (we know they're not that person — splits are
         # sender-disjoint).  This is the easy negative.
-        rng = random.Random(0)
+        rng = random.Random(self._seed)
         other_scores = np.array([])
         if oth_emb is not None and len(oth_emb) > 0:
             assigned = [rng.choice(self._profile_senders) for _ in range(len(oth_emb))]
@@ -396,7 +397,7 @@ def _coverage_at_accuracy(
         # Zero-padded so coverage/at_acc_0.50 sorts before _0.80 and _0.95.
         key = f"coverage/at_acc_{target:.2f}"
         mask = running_acc >= target
-        out[key] = float(coverage[mask].max()) if mask.any() else 0.0
+        out[key] = float(coverage[mask].max()) if mask.any() else float("nan")
 
     return out
 

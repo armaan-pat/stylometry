@@ -39,7 +39,7 @@ import email_fraud.encoders  # noqa: F401  — trigger @register
 import email_fraud.heads     # noqa: F401
 import email_fraud.losses    # noqa: F401
 from email_fraud.config import load_config
-from email_fraud.scoring.metrics import compute_pan_metrics
+from email_fraud.scoring.metrics import compute_verification_metrics
 from email_fraud.utils.logging import setup_logging
 
 logger = logging.getLogger(__name__)
@@ -197,7 +197,7 @@ def main() -> None:
     eval_pairs = load_eval_pairs(str(data_dir))
     labels = np.array([label for _, _, label in eval_pairs], dtype=np.int64)
     scores = score_pairs(encoder, eval_pairs, device, batch_size=args.batch_size)
-    metrics = compute_pan_metrics(labels, scores)
+    metrics = compute_verification_metrics(labels, scores)
 
     logger.info("Evaluation metrics:")
     for key, value in metrics.items():

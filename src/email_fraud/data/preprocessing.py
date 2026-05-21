@@ -91,6 +91,21 @@ _RE_GMAIL_REPLY = re.compile(
 
 _RE_QUOTED_LINE = re.compile(r"^>.*$", re.MULTILINE)
 
+# Order matters: broad patterns run first so fine-grained ones don't partially match.
+_REPLY_STRIP_PATTERNS: list[re.Pattern] = [
+    _RE_FORWARD_BLOCK,
+    _RE_REPLY_CHAIN,
+    _RE_GMAIL_REPLY,
+    _RE_LOTUS_REPLY,
+    _RE_LOTUS_NAMELINE,
+    _RE_LOTUS_ON,
+    _RE_QUOTED_NAME_REPLY,
+    _RE_EXT_REPLY,
+    _RE_BARE_REPLY,
+    _RE_INLINE_HEADER,
+    _RE_QUOTED_LINE,
+]
+
 # Signature separators: "-- " (RFC 3676), "---", "___".
 _RE_SIG_SEPARATOR = re.compile(
     r"(\n-- \n|\n--\n|\n_{3,}\n|\n-{3,}\n).*",
@@ -128,21 +143,6 @@ _BOILERPLATE_ANCHORS: list[re.Pattern] = [
         r"\n[ \t]*(?:is\s+)?[Ii]ntended\s+only\s+for\s+the\s+(?:individual|person|named|use).*",
         re.DOTALL,
     ),
-]
-
-# Order matters: broad patterns run first so fine-grained ones don't partially match.
-_REPLY_STRIP_PATTERNS: list[re.Pattern] = [
-    _RE_FORWARD_BLOCK,
-    _RE_REPLY_CHAIN,
-    _RE_GMAIL_REPLY,
-    _RE_LOTUS_REPLY,
-    _RE_LOTUS_NAMELINE,
-    _RE_LOTUS_ON,
-    _RE_QUOTED_NAME_REPLY,
-    _RE_EXT_REPLY,
-    _RE_BARE_REPLY,
-    _RE_INLINE_HEADER,
-    _RE_QUOTED_LINE,
 ]
 
 # URLs first so "http://user@host" doesn't partially match the email pattern.

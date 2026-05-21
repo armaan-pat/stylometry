@@ -445,7 +445,7 @@ class Trainer:
         import json
         import numpy as np
         import torch.nn.functional as F
-        from email_fraud.scoring.metrics import compute_pan_metrics
+        from email_fraud.scoring.metrics import compute_verification_metrics
 
         pairs_path = self.eval_data_dir / "test_pairs.jsonl"
         if not pairs_path.exists():
@@ -482,7 +482,7 @@ class Trainer:
             sim = F.cosine_similarity(embs[i].unsqueeze(0), embs[i + 1].unsqueeze(0)).item()
             scores.append((sim + 1.0) / 2.0)
         labels = np.array([lbl for _, _, lbl in pairs], dtype=np.int64)
-        return compute_pan_metrics(labels, np.array(scores, dtype=np.float64))
+        return compute_verification_metrics(labels, np.array(scores, dtype=np.float64))
 
     def _build_scheduler(self, steps_per_epoch: int) -> Any:
         """Build the LR scheduler. All schedulers step per batch, not per epoch."""
