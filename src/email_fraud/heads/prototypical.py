@@ -34,6 +34,7 @@ import pickle
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -66,6 +67,9 @@ class PrototypicalHead(BaseHead):
         confidence_tiers: dict[str, str] | None = None,
         distance: str = "cosine",
         score_fn: str = "linear_z3",
+        store_embeddings: bool = True,
+        mahalanobis_min_k: int = 5,
+        ridge: float = 1e-4,
     ) -> None:
         super().__init__()
         self.confidence_tiers = confidence_tiers or {
@@ -79,7 +83,24 @@ class PrototypicalHead(BaseHead):
         # registry validates the name (KeyError if unknown).
         from email_fraud.scoring.score_functions import resolve as _resolve_score_fn
         self.score_fn_name = score_fn
-        self._score_fn = _resolve_score_fn(score_fn)
+        # Mahalanobis-flavor names aren't in the (cos_sim, spread) registry —
+        # they're dispatched directly in .score() below. For backward-compat
+        # we still pre-resolve the legacy cos_sim/spread fns so existing YAMLs
+        # work without change.
+        self._mahalanobis_mode = score_fn in {"mahalanobis", "adaptive_k"}
+        if not self._mahalanobis_mode:
+            self._score_fn = _resolve_score_fn(score_fn)
+        else:
+            self._score_fn = None  # type: ignore[assignment]
+        # Whether to retain raw enrollment embeddings on the profile. Required
+        # for mahalanobis scoring and the K-conditional adaptive fallback.
+        # Defaults on so changes are non-breaking; turn off only if memory matters.
+        self.store_embeddings = store_embeddings or self._mahalanobis_mode
+        # Below this k we fall back to cosine even in mahalanobis modes —
+        # per-sender LW shrinkage of a rank-(k-1) sample covariance is too
+        # noisy until k≈5 (see experiments/v7/CHANGELOG_V7.md K-sweep).
+        self.mahalanobis_min_k = mahalanobis_min_k
+        self.ridge = ridge
         # In-memory dict of profiles; keyed by sender_id string.
         self._profiles: dict[str, dict[str, Any]] = {}
 
@@ -124,6 +145,12 @@ class PrototypicalHead(BaseHead):
                     "spread": spread,
                     "k": len(idx),
                 }
+                if self.store_embeddings:
+                    # Keep raw enrollment embeddings on the profile so we can
+                    # (re-)fit a per-sender Ledoit-Wolf covariance for Mahalanobis.
+                    # CPU storage is fine — these are queried per-sender, not in tight loops.
+                    self._profiles[sid]["embs"] = embs.clone()
+                    self._profiles[sid]["_prec_dirty"] = True
             else:
                 # Incremental update: merge new batch with existing profile.
                 prof = self._profiles[sid]
@@ -142,6 +169,10 @@ class PrototypicalHead(BaseHead):
                 )
                 prof["spread"] = float((1.0 - sims).mean())
                 prof["k"] = new_k
+                if self.store_embeddings:
+                    # Append; covariance will be re-fit lazily on next mahalanobis call.
+                    prof["embs"] = torch.cat([prof["embs"], embs], dim=0)
+                    prof["_prec_dirty"] = True
 
     def score_raw(
         self,
@@ -185,46 +216,109 @@ class PrototypicalHead(BaseHead):
     ) -> dict[str, object]:
         """Return score under the configured score_fn, tier, and abstain flag.
 
-        See email_fraud.scoring.score_functions for the variants. The default
-        (linear_z3) preserves the historical "1.0 = typical, 0.0 = z≥3" mapping.
+        Score-fn dispatch:
+            "mahalanobis" — per-sender Ledoit-Wolf Mahalanobis distance, flipped
+              so higher = more genuine. Wins by +3 AUC pp on g/syn at K=16-25
+              (see experiments/v7/CHANGELOG_V7.md V7.2). Falls back to
+              `linear_z3` when k < mahalanobis_min_k.
+            "adaptive_k" — cosine for k < mahalanobis_min_k (Σ too unreliable),
+              mahalanobis otherwise. The recommended production default.
+            anything else — passes through to the (cos_sim, spread) registry.
         """
         raw = self.score_raw(query, sender_id)
         if raw["tier"] == "unknown":
             return {"score": 0.0, "tier": "unknown", "abstain": True}
-        normalized_score = self._score_fn(float(raw["cos_sim"]), float(raw["spread"]))
+
+        if self._mahalanobis_mode:
+            prof = self._profiles[sender_id]
+            k = int(prof["k"])
+            if k >= self.mahalanobis_min_k and "embs" in prof:
+                mahal_dist = self._mahalanobis_distance(query, prof)
+                score_val = -mahal_dist
+            else:
+                # Either k too small for a reliable Σ or embeddings weren't
+                # stored (legacy profile). Fall back to cosine in both modes.
+                from email_fraud.scoring.score_functions import cosine as _cosine
+                score_val = _cosine(float(raw["cos_sim"]), float(raw["spread"]))
+        else:
+            score_val = self._score_fn(float(raw["cos_sim"]), float(raw["spread"]))
+
         return {
-            "score": normalized_score,
+            "score": float(score_val),
             "tier": raw["tier"],
             "abstain": raw["abstain"],
         }
 
+    # ------------------------------------------------------------------
+    # Mahalanobis path
+    # ------------------------------------------------------------------
+
+    def _refresh_precision(self, prof: dict[str, Any]) -> None:
+        """Refit the Ledoit-Wolf shrinkage covariance and cache its inverse.
+
+        Done lazily on the first mahalanobis query after an upsert so we don't
+        pay the cost during enrollment. Stored fields:
+            _prec      — d×d precision matrix (regularised inverse of Σ)
+            _shrinkage — α from LW (informational; should be in (0, 1))
+        """
+        from sklearn.covariance import LedoitWolf
+
+        embs = prof["embs"].cpu().numpy().astype(np.float64)
+        if embs.shape[0] < 2:
+            d = embs.shape[1]
+            prof["_prec"] = np.eye(d, dtype=np.float64)
+            prof["_shrinkage"] = 1.0
+        else:
+            lw = LedoitWolf().fit(embs)
+            cov = lw.covariance_
+            d = cov.shape[0]
+            scale = float(np.trace(cov)) / d
+            cov_reg = cov + self.ridge * scale * np.eye(d, dtype=np.float64)
+            prof["_prec"] = np.linalg.inv(cov_reg)
+            prof["_shrinkage"] = float(lw.shrinkage_)
+        prof["_prec_dirty"] = False
+
+    def _mahalanobis_distance(self, query: torch.Tensor, prof: dict[str, Any]) -> float:
+        if prof.get("_prec_dirty", True):
+            self._refresh_precision(prof)
+        q = query.cpu().numpy().astype(np.float64)
+        mu = prof["centroid"].cpu().numpy().astype(np.float64)
+        diff = q - mu
+        val = float(diff @ prof["_prec"] @ diff)
+        return float(np.sqrt(max(val, 0.0)))
+
     def save(self, path: str) -> None:
         # Convert tensors to numpy for pickle portability across PyTorch versions.
-        payload = {
-            sid: {
+        payload = {}
+        for sid, prof in self._profiles.items():
+            entry: dict[str, Any] = {
                 "centroid": prof["centroid"].numpy(),
                 "spread": prof["spread"],
                 "k": prof["k"],
             }
-            for sid, prof in self._profiles.items()
-        }
+            if "embs" in prof:
+                entry["embs"] = prof["embs"].numpy()
+            payload[sid] = entry
         with open(path, "wb") as fh:
             pickle.dump(payload, fh)
 
     def load(self, path: str) -> None:
-        import numpy as np
-
         with open(path, "rb") as fh:
             payload = pickle.load(fh)
-        # Restore numpy arrays back to PyTorch tensors.
-        self._profiles = {
-            sid: {
+        # Restore numpy arrays back to PyTorch tensors. Embeddings are optional
+        # (older profile files don't have them); mark precision dirty so it
+        # refits lazily on the first mahalanobis call.
+        self._profiles = {}
+        for sid, data in payload.items():
+            prof: dict[str, Any] = {
                 "centroid": torch.from_numpy(np.array(data["centroid"])),
                 "spread": data["spread"],
                 "k": data["k"],
             }
-            for sid, data in payload.items()
-        }
+            if "embs" in data:
+                prof["embs"] = torch.from_numpy(np.array(data["embs"]))
+                prof["_prec_dirty"] = True
+            self._profiles[sid] = prof
 
     # ------------------------------------------------------------------
     # Mahalanobis stub
@@ -235,18 +329,22 @@ class PrototypicalHead(BaseHead):
         query: torch.Tensor,
         sender_id: str,
     ) -> float:
-        # TODO: add tied covariance + Ledoit-Wolf shrinkage estimation.
-        # Full implementation should:
-        #   1. Collect all stored embeddings for sender_id.
-        #   2. Estimate covariance with sklearn LedoitWolf (or OAS).
-        #      Ledoit-Wolf is preferred over raw MLE covariance because it
-        #      regularizes the estimate for high-dimensional embeddings (d >> k).
-        #   3. Compute Mahalanobis distance to centroid.
-        #   4. Return distance (lower = more in-distribution).
-        raise NotImplementedError(
-            "Mahalanobis scoring not yet implemented. "
-            "See TODO comment in mahalanobis_score()."
-        )
+        """Per-sender Ledoit-Wolf Mahalanobis distance to the centroid.
+
+        Lower = more in-distribution (raw distance, not flipped). Returns
+        +inf if the sender is unknown, raises if the profile was loaded
+        without embeddings.
+        """
+        if sender_id not in self._profiles:
+            return float("inf")
+        prof = self._profiles[sender_id]
+        if "embs" not in prof:
+            raise RuntimeError(
+                f"Cannot compute Mahalanobis for sender {sender_id!r}: "
+                "profile was built/loaded without raw embeddings. "
+                "Re-fit with store_embeddings=True (default)."
+            )
+        return self._mahalanobis_distance(query.detach().cpu().squeeze(), prof)
 
     # ------------------------------------------------------------------
     # Private helpers

@@ -12,6 +12,7 @@ env/
 # Data (never commit raw or processed corpora)
 data/raw/
 data/processed/
+data/synthetic/
 
 # Model artifacts
 checkpoints/
@@ -42,3 +43,7 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+
+
+logs/
+runs/

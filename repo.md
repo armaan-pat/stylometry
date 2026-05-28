@@ -225,4 +225,22 @@ result = pipeline.score(email_body, claimed_sender="cfo@company.com")
 
 ---
 
-*Last updated: 2026-05-12*
+*Last updated: 2026-05-28 (V7)*
+
+## V7 — Mahalanobis scoring + retrained encoder (2026-05-28)
+
+See `experiments/v7/CHANGELOG_V7.md` for the full experimental log. Headline:
+
+- **V7.0**: per-sender Ledoit-Wolf Mahalanobis distance, computed from the
+  stored enrollment embeddings, replaces (or complements) the cosine
+  z-score in `PrototypicalHead`. Wins by **+1-3 AUC pp on g/synthetic and
+  +6-9 pp on TPR@5%FPR** across the K=8..25 range over the v6 encoder.
+- **V7.2**: the win widens with enrollment size — at K=16 Mahalanobis adds
+  **+3.1 AUC pp** and **+9.2 TPR@5%FPR pp** over cosine. Recommended
+  production scoring is `adaptive_k` (cosine for k<5, Mahalanobis for k≥5)
+  — implemented and tested in `src/email_fraud/heads/prototypical.py`.
+- **V7.3**: retrained the encoder with `n_syn=4` (vs 2), `temperature=0.05`
+  (vs 0.07), and an added LoRA target (key). Config:
+  `configs/experiments/v7_luar_lora_syn_mahal.yaml`. Run with
+  `python scripts/train.py --config configs/experiments/v7_luar_lora_syn_mahal.yaml`.
+  Evaluate with `python scripts/eval_v7_full.py --v7-checkpoint <path>`.

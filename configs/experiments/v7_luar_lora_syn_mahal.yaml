@@ -1,0 +1,99 @@
+# V7 ablation — same v6 LUAR + LoRA + synthetic recipe, retuned for Mahalanobis-friendly embedding space.
+#
+# Why this config exists:
+#   v6's encoder was trained for cosine-similarity SupCon. The V7 scoring sweep
+#   (experiments/v7/CHANGELOG_V7.md) showed that per-sender Ledoit-Wolf
+#   Mahalanobis is a strictly better scorer once K ≥ 8, gaining ~3 pp AUC on
+#   the hardest (genuine vs synthetic) split at K=16-25. That gain is purely
+#   on the inference side — the encoder is unchanged. This config asks: can
+#   we push it further by retraining with knobs that *encourage* an
+#   informative per-sender covariance?
+#
+# Changes from v6_luar_lora_syn.yaml (everything else identical):
+#   loss.temperature   0.07 → 0.05    sharper softmax — harder negatives get
+#                                     stronger gradient on the synthetic pool
+#   data.aug.n_syn     2   → 4        more (real, synthetic) pairs per batch
+#   encoder.lora.target_modules  +key       more LoRA capacity in attention
+#   training.epochs    100 → 150      no early stopping; let it train
+#   head.score_fn      linear_z3 → adaptive_k  log Mahalanobis-flavored metrics
+#                                              alongside cosine ones during training
+#
+# Eval after training: run scripts/eval_v7_scoring.py + eval_v7_k_sweep.py
+# pointed at the new checkpoint. If AUC[g/syn] @ K=8 crosses 0.90 with
+# adaptive_k scoring we ship the new encoder.
+
+encoder:
+  model_name_or_path: rrivera1849/LUAR-MUD
+  pooling: luar_episode
+  freeze_backbone: false
+  lora:
+    r: 16
+    alpha: 32
+    target_modules:
+      - query
+      - value
+      - key
+    dropout: 0.05
+  max_length: 512
+  projection_dim: 128
+  episode_k: 4
+  trust_remote_code: true
+
+loss:
+  name: supcon
+  temperature: 0.05
+
+head:
+  name: prototypical
+  # Adaptive: cosine for k < 5 (low confidence), Mahalanobis at higher k.
+  # The CentroidProbe inside training still evaluates several variants (see
+  # eval_score_fns below) so we get apples-to-apples comparisons against v6
+  # in W&B without needing to rerun.
+  score_fn: adaptive_k
+  eval_score_fns:
+    - linear_z3   # canonical v6 metric (un-prefixed in W&B)
+    - cosine
+    - sigmoid_z
+
+data:
+  train_senders: 100
+  emails_per_sender_k: 8
+  val_split: 0.1
+  test_split: 0.1
+  augmentation:
+    synthetic_path: data/synthetic/enron_synthetic
+    n_syn_per_batch: 4
+
+training:
+  epochs: 150
+  batch_size: 64
+  lr: 2.0e-4
+  scheduler: cosine
+  warmup_steps: 200
+  grad_clip: 1.0
+  mixed_precision: true
+  monitor: auc/genuine_vs_synthetic
+  monitor_mode: max
+  early_stopping_patience: 0
+  early_stopping_min_delta: 1.0e-3
+  keep_last_n: 1
+  hard_negative_mining:
+    enabled: true
+    warmup_epochs: 20
+    ramp_epochs: 30
+    interval: 5
+    n_pairs: 20
+    max_hard_fraction: 0.5
+
+wandb:
+  name: v7_luar_lora_syn_mahal
+  tags:
+    - luar
+    - lora
+    - projection
+    - supcon
+    - episode-pooling
+    - synthetic-hard-negatives
+    - v7-ablation
+    - mahalanobis-aware
+  notes: "V7 ablation: LUAR-MUD + LoRA (r=16, +key/+output) + synthetic (n_syn=4) + temperature 0.05. Trained for use with Mahalanobis scoring."
