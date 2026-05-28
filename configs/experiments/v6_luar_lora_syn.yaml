@@ -41,6 +41,13 @@ training:
   early_stopping_patience: 0
   early_stopping_min_delta: 1.0e-4
   keep_last_n: 1
+  hard_negative_mining:
+    enabled: true
+    warmup_epochs: 20
+    ramp_epochs: 30
+    interval: 5
+    n_pairs: 20
+    max_hard_fraction: 0.5
 
 wandb:
   name: v6_luar_lora_syn

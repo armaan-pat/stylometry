@@ -1,23 +1,8 @@
-"""PKSampler — produces P×K structured batches for contrastive training.
+"""P×K batch sampler for contrastive training.
 
-Each yielded index-list contains exactly P senders × K emails, guaranteeing
-every batch has the label structure required by SupConLoss and batch-hard
-TripletLoss.
-
-Reference design from: Hermans, Beyer, Leibe "In Defense of the Triplet Loss"
-arXiv:1703.07737, Section 2 (batch construction).
-
-Why P×K sampling?
------------------
-Contrastive losses need multiple emails per sender in each batch to form
-positive pairs / triplets.  A standard random sampler would frequently produce
-batches where a sender appears only once (no positives → no loss signal).
-
-With P=16 senders and K=4 emails each (N=64 per batch), every anchor has
-K-1=3 guaranteed positives and (P-1)*K=60 negatives — a rich training signal.
-
-The tradeoff: P and K must satisfy P*K <= batch_size, and each sender must
-have >= K emails in the dataset.  Senders with fewer are silently excluded.
+Each yielded index list contains exactly P senders × K emails, giving every anchor
+at least K-1 guaranteed positives and (P-1)×K negatives per batch.
+Senders with fewer than K emails are excluded.
 """
 
 from __future__ import annotations
@@ -28,16 +13,19 @@ from collections import defaultdict
 from torch.utils.data import Sampler
 
 
-class PKSampler(Sampler[list[int]]):
-    """Sample P senders × K emails per batch, without replacement per sender.
+def _weighted_sample_no_replace(
+    items: list, weights: list[float], k: int, rng: random.Random
+) -> list:
+    """Weighted sampling without replacement via Efraimidis-Spirakis."""
+    if not items or k <= 0:
+        return []
+    keys = [rng.random() ** (1.0 / max(w, 1e-9)) for w in weights]
+    scored = sorted(zip(keys, items), reverse=True)
+    return [item for _, item in scored[:k]]
 
-    Args:
-        sender_ids:  Per-item sender id strings (length N, one per dataset item).
-        p:           Number of distinct senders per batch.
-        k:           Number of emails per sender per batch.
-        drop_last:   If True (default), skip the last partial batch of senders.
-        seed:        Optional RNG seed for reproducibility.
-    """
+
+class PKSampler(Sampler[list[int]]):
+    """Sample P senders × K emails per batch, without intra-batch replacement."""
 
     def __init__(
         self,
@@ -56,14 +44,10 @@ class PKSampler(Sampler[list[int]]):
         # weight initialization or data augmentation.
         self._rng = random.Random(seed)
 
-        # Build per-sender index lists from the flat sender_ids list.
-        # defaultdict(list) avoids explicit "if not in" checks.
         self._sender_to_indices: dict[str, list[int]] = defaultdict(list)
         for idx, sid in enumerate(sender_ids):
             self._sender_to_indices[sid].append(idx)
 
-        # Only keep senders with at least K emails — senders with fewer cannot
-        # fill a K-slot without repetition, which would bias the contrastive signal.
         self._eligible_senders: list[str] = [
             sid
             for sid, indices in self._sender_to_indices.items()
@@ -77,77 +61,88 @@ class PKSampler(Sampler[list[int]]):
                 f"only {len(self._eligible_senders)} qualify."
             )
 
+        self._hard_pairs: list[tuple[str, str]] = []
+        self._hard_fraction: float = 0.0
+
+    def set_hard_pairs(
+        self, pairs: list[tuple[str, str]], hard_fraction: float = 0.5
+    ) -> None:
+        """Update confusable pairs for hard-batch construction (called each epoch by Trainer)."""
+        eligible_set = set(self._eligible_senders)
+        self._hard_pairs = [(a, b) for a, b in pairs if a in eligible_set and b in eligible_set]
+        self._hard_fraction = hard_fraction
+
+    def _build_batch_indices(self, batch_senders: list[str]) -> list[int]:
+        indices: list[int] = []
+        for sid in batch_senders:
+            pool = list(self._sender_to_indices[sid])
+            self._rng.shuffle(pool)
+            indices.extend(pool[: self.k])
+        return indices
+
     def __iter__(self):
-        # Shuffle senders at the start of each epoch so batch composition varies.
         senders = list(self._eligible_senders)
         self._rng.shuffle(senders)
 
-        # Number of complete P-sized sender groups in this epoch.
-        n_batches = len(senders) // self.p
-        if not self.drop_last and len(senders) % self.p:
-            n_batches += 1
+        if not self._hard_pairs:
+            n_batches = len(senders) // self.p
+            if not self.drop_last and len(senders) % self.p:
+                n_batches += 1
+            for batch_idx in range(n_batches):
+                batch_senders = senders[batch_idx * self.p : (batch_idx + 1) * self.p]
+                if len(batch_senders) < self.p:
+                    continue
+                yield self._build_batch_indices(batch_senders)
+            return
 
-        for batch_idx in range(n_batches):
-            batch_senders = senders[batch_idx * self.p : (batch_idx + 1) * self.p]
-            if len(batch_senders) < self.p:
-                # Last partial group when drop_last=False — skip for now
-                # (padding logic not yet implemented).
+        # Hard-batch mode: explicitly co-sample confusable pairs.
+        n_total = len(senders) // self.p
+        n_hard = max(1, int(n_total * self._hard_fraction))
+
+        pairs_shuffled = list(self._hard_pairs)
+        self._rng.shuffle(pairs_shuffled)
+
+        used: set[str] = set()
+        hard_batches: list[list[str]] = []
+
+        for a, b in pairs_shuffled:
+            if len(hard_batches) >= n_hard:
+                break
+            if a in used or b in used:
                 continue
+            fillers = [s for s in senders if s not in used and s != a and s != b]
+            if len(fillers) < self.p - 2:
+                continue
+            self._rng.shuffle(fillers)
+            batch = [a, b] + fillers[: self.p - 2]
+            hard_batches.append(batch)
+            used.update(batch)
 
-            indices: list[int] = []
-            for sid in batch_senders:
-                # Shuffle this sender's emails and take the first K.
-                # Using a copy so the original list isn't mutated between epochs.
-                pool = list(self._sender_to_indices[sid])
-                self._rng.shuffle(pool)
-                # Slicing to K gives "without replacement within a batch" semantics.
-                # Across epochs, the same email may appear in different batches.
-                indices.extend(pool[: self.k])
+        remaining = [s for s in senders if s not in used]
+        n_random = len(remaining) // self.p
+        random_batches = [
+            remaining[i * self.p : (i + 1) * self.p] for i in range(n_random)
+        ]
 
-            # Yield a flat list of P*K dataset indices.
-            # The DataLoader collects these into a batch via episode_collate.
-            yield indices
+        all_batches = hard_batches + random_batches
+        self._rng.shuffle(all_batches)
+
+        for batch_senders in all_batches:
+            if len(batch_senders) < self.p:
+                continue
+            yield self._build_batch_indices(batch_senders)
 
     def __len__(self) -> int:
-        # Number of P×K batches yielded per epoch.
-        # With a batch_sampler, DataLoader uses this directly as len(dataloader).
         return len(self._eligible_senders) // self.p
-
-
-# ---------------------------------------------------------------------------
-# SyntheticBalancedSampler
-# ---------------------------------------------------------------------------
 
 _SYN_SUFFIX = "__syn"
 
 
 class SyntheticBalancedSampler(Sampler[list[int]]):
-    """PKSampler variant that guarantees n_syn synthetic–real sender pairs per batch.
+    """PKSampler that guarantees n_syn synthetic–real sender pairs per batch.
 
-    Each batch of P senders is structured as:
-        - n_syn  synthetic senders  (e.g. "alice@enron.com__syn")
-        - n_syn  their real counterparts  ("alice@enron.com")
-        - P - 2*n_syn  other real senders (no synthetic counterpart in this batch)
-
-    This guarantees that for every batch the contrastive loss directly compares
-    real emails against LLM-generated imitations of the same person — the hardest
-    possible negatives — rather than relying on random batch composition to produce
-    these pairs.
-
-    Senders with a synthetic counterpart are *only* drawn as pairs; they never
-    appear solo.  Senders without a synthetic counterpart fill the remaining slots.
-
-    Args:
-        sender_ids:    Per-item sender id strings (one per dataset item).
-                       Synthetic senders must end with "__syn" and their real
-                       counterpart must also be present (e.g. "alice__syn" requires
-                       "alice" to exist).
-        p:             Total senders per batch (real + synthetic combined).
-        k:             Emails per sender per batch.
-        n_syn:         Number of synthetic–real pairs per batch.  Must satisfy
-                       2 * n_syn <= p.
-        drop_last:     Skip the last partial batch if the epoch runs dry.
-        seed:          Optional RNG seed.
+    Each batch: n_syn synthetic senders + n_syn real counterparts + (P - 2*n_syn) fillers.
+    Synthetic senders must end with "__syn"; their real counterpart must also be present.
     """
 
     def __init__(
@@ -171,7 +166,6 @@ class SyntheticBalancedSampler(Sampler[list[int]]):
         self.drop_last = drop_last
         self._rng = random.Random(seed)
 
-        # Build per-sender index lists.
         sender_to_indices: dict[str, list[int]] = defaultdict(list)
         for idx, sid in enumerate(sender_ids):
             sender_to_indices[sid].append(idx)
@@ -179,28 +173,21 @@ class SyntheticBalancedSampler(Sampler[list[int]]):
         def _eligible(sid: str) -> bool:
             return len(sender_to_indices[sid]) >= k
 
-        # Identify synthetic senders and their real counterparts.
         syn_senders = {sid for sid in sender_to_indices if sid.endswith(_SYN_SUFFIX)}
         real_senders = {sid for sid in sender_to_indices if not sid.endswith(_SYN_SUFFIX)}
 
-        # Pairs: (real_sid, syn_sid) where both are eligible.
         self._eligible_pairs: list[tuple[str, str]] = []
         for syn_sid in syn_senders:
             real_sid = syn_sid[: -len(_SYN_SUFFIX)]
             if real_sid in real_senders and _eligible(real_sid) and _eligible(syn_sid):
                 self._eligible_pairs.append((real_sid, syn_sid))
 
-        # Real-only senders: real senders that do NOT have a synthetic counterpart.
-        # These primarily fill the remaining P - 2*n_syn slots per batch.
         paired_real = {real for real, _ in self._eligible_pairs}
         self._eligible_real_only: list[str] = [
             sid for sid in real_senders if sid not in paired_real and _eligible(sid)
         ]
-        # Fallback pool: when there aren't enough true real-only senders to fill the
-        # filler slots, paired senders may also be drawn as fillers (solo, without
-        # their __syn twin). Tracked separately from _eligible_real_only so analysis
-        # code can still distinguish "filled by true real-only" vs "filled by a
-        # paired sender acting solo".
+        # When real-only senders run out, paired senders can fill the remaining slots
+        # solo (without their __syn twin). Tracked separately for W&B telemetry.
         self._eligible_paired_real: list[str] = sorted(paired_real)
 
         slots_real_only = p - 2 * n_syn
@@ -223,33 +210,35 @@ class SyntheticBalancedSampler(Sampler[list[int]]):
             )
 
         self._sender_to_indices = dict(sender_to_indices)
-        # Per-epoch composition telemetry. Populated by __iter__ as it runs; the
-        # trainer pulls it after each epoch via pop_epoch_stats() and logs to W&B.
-        # Why expose this: when no true real-only senders exist (or too few), the
-        # filler slots fall back to paired senders drawn solo, which means a paired
-        # sender's per-epoch exposure splits between two roles. This counter makes
-        # that split observable instead of hidden behind RNG.
         self._real_only_pool_size = len(self._eligible_real_only)
         self._paired_real_pool_size = len(self._eligible_paired_real)
         self._epoch_stats: dict[str, float] = {}
+        self._hard_sender_weights: dict[str, float] = {}
+        self._hard_fraction: float = 0.0
+
+    def set_hard_pairs(
+        self, pairs: list[tuple[str, str]], hard_fraction: float = 0.5
+    ) -> None:
+        """Update per-sender weights derived from confusable pairs for filler selection."""
+        weights: dict[str, float] = {}
+        for a, b in pairs:
+            weights[a] = weights.get(a, 0.0) + 1.0
+            weights[b] = weights.get(b, 0.0) + 1.0
+        max_w = max(weights.values(), default=1.0)
+        self._hard_sender_weights = {s: w / max_w for s, w in weights.items()}
+        self._hard_fraction = hard_fraction
 
     def __iter__(self):
         pairs = list(self._eligible_pairs)
         self._rng.shuffle(pairs)
 
         slots_real_only = self.p - 2 * self.n_syn
-        # When the true real-only pool is too small we draw the remainder from
-        # paired senders, used solo (their __syn twin is not added to the batch).
-        # Per-batch we exclude that batch's chosen pair-reals from the filler
-        # candidates to prevent any sender from appearing twice in one batch.
         n_batches = len(pairs) // self.n_syn if self.n_syn > 0 else 0
 
         real_only_set = set(self._eligible_real_only)
-        # Reset accumulators at the start of each epoch.
         n_filler_real_only = 0
         n_filler_paired_solo = 0
         n_filler_total = 0
-        # Exposure tracking — how many times each sender appeared in each role.
         from collections import Counter as _Counter
         exposure_as_pair: _Counter = _Counter()
         exposure_as_filler: _Counter = _Counter()
@@ -262,8 +251,16 @@ class SyntheticBalancedSampler(Sampler[list[int]]):
                 sid for sid in self._eligible_paired_real
                 if sid not in chosen_pair_reals
             ]
-            self._rng.shuffle(filler_candidates)
-            batch_real = filler_candidates[:slots_real_only]
+            if self._hard_sender_weights:
+                filler_weights = [
+                    self._hard_sender_weights.get(s, 1e-2) for s in filler_candidates
+                ]
+                batch_real = _weighted_sample_no_replace(
+                    filler_candidates, filler_weights, slots_real_only, self._rng
+                )
+            else:
+                self._rng.shuffle(filler_candidates)
+                batch_real = filler_candidates[:slots_real_only]
             if len(batch_real) < slots_real_only:
                 # Should be impossible given the constructor check, but guard anyway.
                 break
@@ -278,9 +275,6 @@ class SyntheticBalancedSampler(Sampler[list[int]]):
             for real_sid, _syn_sid in batch_pairs:
                 exposure_as_pair[real_sid] += 1
 
-            # Interleave: real counterpart immediately before its synthetic twin so
-            # episode_collate assigns them adjacent batch-local labels (cosmetic only,
-            # loss is label-order invariant).
             batch_senders: list[str] = []
             for real_sid, syn_sid in batch_pairs:
                 batch_senders.extend([real_sid, syn_sid])
@@ -294,13 +288,7 @@ class SyntheticBalancedSampler(Sampler[list[int]]):
 
             yield indices
 
-        # Stash epoch composition so the trainer can log it. Keys are flat so they
-        # can be merged directly into the W&B step dict.
-        fallback_frac = (
-            n_filler_paired_solo / n_filler_total if n_filler_total else 0.0
-        )
-        # "Pair-only" exposure: senders that played the pair role but never appeared
-        # solo as a filler. When the fallback is heavy this number drops.
+        fallback_frac = n_filler_paired_solo / n_filler_total if n_filler_total else 0.0
         pair_only_senders = sum(
             1 for s in exposure_as_pair if exposure_as_filler.get(s, 0) == 0
         )
@@ -315,18 +303,10 @@ class SyntheticBalancedSampler(Sampler[list[int]]):
         }
 
     def pop_epoch_stats(self) -> dict[str, float]:
-        """Return the most recent epoch's composition stats and reset.
-
-        Trainer calls this after exhausting the DataLoader for one epoch to merge
-        sampler telemetry into the W&B step dict. Returning a fresh dict (and
-        clearing self) means double-calls or skipped epochs don't double-log.
-        """
+        """Return epoch composition stats and reset; called by Trainer after each epoch."""
         stats = dict(self._epoch_stats)
         self._epoch_stats = {}
         return stats
 
     def __len__(self) -> int:
-        # Limit is now just the pair pool, since fillers can always be drawn from
-        # (real_only ∪ paired_real \ this_batch's_pair_reals), and the constructor
-        # ensures that combined pool is large enough.
         return len(self._eligible_pairs) // self.n_syn if self.n_syn > 0 else 0

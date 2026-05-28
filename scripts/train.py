@@ -256,6 +256,8 @@ def _run_training(cfg, EncoderClass, LossClass, HeadClass, args, output_dir: Pat
         eval_config_path=Path(args.config).resolve(),
         eval_data_dir=cfg.data.processed_dir,
         centroid_probe=centroid_probe,
+        preprocessing=cfg.data.preprocessing,
+        train_dataset=train_dataset,
     )
     trainer.train(train_loader, val_loader)
 

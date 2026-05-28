@@ -133,7 +133,10 @@ class SenderProfileStore:
         """
         # TODO: collect stored per-sender embeddings, estimate covariance via
         #       sklearn.covariance.LedoitWolf, compute proper Mahalanobis distance.
-        return 0.0
+        raise NotImplementedError(
+            "Mahalanobis scoring not yet implemented. "
+            "See TODO comment in mahalanobis_score()."
+        )
 
     def confidence_tier(self, sender_id: str) -> str:
         """Return the confidence tier string based on how many emails are stored."""

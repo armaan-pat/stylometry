@@ -1,20 +1,7 @@
 """Pydantic v2 config schema and YAML loader.
 
-ExperimentConfig is the single source of truth for every run.  Loading merges
-configs/base.yaml (defaults) with the experiment file so experiment files only
-need to specify what differs from the defaults.
-
-Config composition
-------------------
-1. configs/base.yaml  — global defaults (never checked in with secrets)
-2. configs/<experiment>.yaml — overrides for a specific experiment
-3. _deep_merge() — recursively merges so nested keys can be partially overridden
-
-Example: to change only the learning rate, your experiment yaml only needs:
-    training:
-      lr: 5e-5
-
-All other training fields inherit from base.yaml.
+configs/base.yaml holds defaults; experiment files only override what changes.
+_deep_merge handles nested keys so you don't have to repeat sibling fields.
 """
 
 from __future__ import annotations
@@ -26,23 +13,8 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
 
-# ---------------------------------------------------------------------------
-# Sub-configs
-# ---------------------------------------------------------------------------
-
-
 class LoRAConfig(BaseModel):
-    """Low-Rank Adaptation settings for the transformer backbone.
-
-    LoRA adds trainable rank-r matrices to targeted attention layers.
-    Only adapter weights are updated; the backbone remains frozen.
-
-    r: rank of the adapter matrices (higher = more capacity, more params).
-    alpha: scaling factor; effective lr for adapters is (alpha/r) * lr.
-    target_modules: which attention projections to adapt.
-      ["query", "value"] is the standard config from the LoRA paper (Hu et al. 2021).
-    dropout: regularization on adapter activations.
-    """
+    """LoRA adapter settings. alpha/r scales the adapter learning rate."""
     model_config = ConfigDict(extra="forbid")
 
     r: int = 8
@@ -52,18 +24,7 @@ class LoRAConfig(BaseModel):
 
 
 class EncoderConfig(BaseModel):
-    """Configuration for the text encoder (backbone + pooling + optional projection).
-
-    name: registry key for the encoder class ("hf" → HFEncoder).
-    model_name_or_path: HuggingFace model id or local path to a checkpoint.
-    pooling: token aggregation strategy — "mean", "cls", or "luar_episode".
-    lora: if set, wrap backbone with LoRA adapters (cheap fine-tuning).
-    freeze_backbone: if True and lora is None, backbone is a fixed feature extractor;
-                     only a projection head (if any) is trained.
-    max_length: max tokens per email; longer inputs are silently truncated.
-    projection_dim: if set, add a linear layer backbone_dim → projection_dim.
-                    Useful for controlling embedding size independently of backbone.
-    """
+    """Text encoder config. pooling: "mean", "cls", or "luar_episode"."""
     model_config = ConfigDict(extra="forbid")
 
     name: str = "hf"
@@ -78,16 +39,7 @@ class EncoderConfig(BaseModel):
 
 
 class LossConfig(BaseModel):
-    """Configuration for the contrastive loss function.
-
-    name: registry key — "supcon", "triplet", or "contrastive".
-    temperature: for SupConLoss; lower = sharper softmax (harder negatives dominate).
-    margin: for TripletLoss and ContrastiveLoss; minimum separation for negative pairs.
-    mining: pair/triplet mining strategy:
-      "batch_hard" (triplet) — hardest positive + hardest negative per anchor.
-      "all" (triplet/contrastive) — all valid (anchor, pos, neg) combinations.
-      "semi_hard" (contrastive) — negatives outside the positive cluster but inside margin.
-    """
+    """Contrastive loss config. name: "supcon", "triplet", or "contrastive"."""
     model_config = ConfigDict(extra="forbid")
 
     name: str = "supcon"
@@ -97,12 +49,7 @@ class LossConfig(BaseModel):
 
 
 class HeadConfig(BaseModel):
-    """Configuration for the anomaly-scoring head.
-
-    name: registry key — "prototypical" or "cross_encoder".
-    distance: metric for centroid-to-query comparison ("cosine" is the only live option).
-    shrinkage: covariance shrinkage for Mahalanobis scoring (stub, not yet implemented).
-    """
+    """Scoring head config. shrinkage is a stub (Mahalanobis not yet implemented)."""
     model_config = ConfigDict(extra="forbid")
 
     name: str = "prototypical"
@@ -111,36 +58,22 @@ class HeadConfig(BaseModel):
 
 
 class PreprocessingConfig(BaseModel):
-    """Controls which cleaning steps are applied to email bodies.
-
-    strip_quoted: remove reply/forward chains (keeps only the newest message).
-    strip_signatures: cut text after signature separators (-- / --- / ___).
-    entity_masking: replace URLs, emails, dates, phones with [PLACEHOLDER] tokens.
-                    Reduces encoder noise but removes potentially useful stylometric cues.
-    fix_encoding: run ftfy to fix garbled Unicode common in old Enron data.
-    min_body_chars: drop emails shorter than this after cleaning (50 ≈ 10 words).
-    max_body_chars: truncate bodies longer than this (4000 chars ≈ 800 tokens).
-    """
+    """Email cleaning pipeline flags."""
     model_config = ConfigDict(extra="forbid")
 
     strip_quoted: bool = True
     strip_signatures: bool = True
+    strip_boilerplate: bool = True
     entity_masking: bool = False
     fix_encoding: bool = True          # run ftfy to fix garbled unicode/encoding artifacts
     min_body_chars: int = 50           # drop emails shorter than this after cleaning
+    min_body_words: int = 20           # drop emails with fewer than this many whitespace-split tokens
+    min_alnum_ratio: float = 0.60      # drop emails where <60% of chars are alphanumeric or space
     max_body_chars: int = 4000         # truncate bodies longer than this
 
 
 class AugmentationConfig(BaseModel):
-    """Settings for LLM-generated synthetic hard negatives.
-
-    synthetic_path: path to the Arrow dataset produced by
-                    scripts/generate_synthetic_emails.py.  If None, augmentation
-                    is disabled and a standard PKSampler is used.
-    n_syn_per_batch: number of synthetic–real sender pairs to guarantee per batch.
-                     Each pair occupies 2 of the P sender slots.  Passed directly
-                     to SyntheticBalancedSampler as n_syn.
-    """
+    """LLM-generated synthetic hard-negative settings. synthetic_path=None disables augmentation."""
     model_config = ConfigDict(extra="forbid")
 
     synthetic_path: str | None = None
@@ -148,18 +81,7 @@ class AugmentationConfig(BaseModel):
 
 
 class DataConfig(BaseModel):
-    """Dataset paths and sampling parameters.
-
-    dataset: registry key for the dataset class ("enron" → EnronDataset).
-    data_dir: path to raw .msg files (consumed by scripts/prepare_data.py only).
-    processed_dir: path to Arrow-format processed dataset (consumed by EnronDataset).
-    train_senders: number of senders in the training split.
-    min_emails_per_sender: senders with fewer are excluded from all splits.
-    emails_per_sender_k: target K for PKSampler (emails per sender per batch).
-    val_split / test_split: fraction of eligible senders reserved for val/test.
-    preprocessing: nested config controlling email cleaning.
-    augmentation: optional synthetic hard-negative augmentation settings.
-    """
+    """Dataset paths and sampling parameters."""
     model_config = ConfigDict(extra="forbid")
 
     dataset: str = "enron"
@@ -174,26 +96,20 @@ class DataConfig(BaseModel):
     augmentation: AugmentationConfig = Field(default_factory=AugmentationConfig)
 
 
-class TrainingConfig(BaseModel):
-    """Training loop hyperparameters and checkpointing settings.
+class HardNegativeMiningConfig(BaseModel):
+    """Offline hard negative mining with curriculum scheduling."""
+    model_config = ConfigDict(extra="forbid")
 
-    epochs: total training epochs.
-    batch_size: total batch size (P*K); P and K are derived from PKSampler settings.
-    lr: initial learning rate for AdamW.
-    scheduler: LR schedule — "cosine" (recommended), "linear", or "constant".
-    warmup_steps: steps to linearly ramp LR from ~0 to lr.
-                  Critical for transformer fine-tuning — avoids large initial gradients.
-    grad_clip: max gradient norm for clip_grad_norm_ (1.0 is standard for BERT-family).
-    mixed_precision: float16 AMP on CUDA for ~2x speed on Ampere+ GPUs.
-    output_dir: root for all run outputs; each run writes to output_dir/<run_name>/.
-    checkpoint_every_n: save a numbered checkpoint every N epochs.
-    keep_last_n: delete numbered checkpoints older than the last N (0 = keep all).
-    save_best: maintain checkpoint_best.pt for the lowest val/loss epoch.
-    early_stopping_patience: stop after this many epochs without val/loss improvement
-                             (improvement = drop of at least early_stopping_min_delta).
-                             0 disables early stopping (train the full epochs budget).
-    early_stopping_min_delta: minimum val/loss decrease to count as improvement.
-    """
+    enabled: bool = False
+    warmup_epochs: int = 20       # epochs before any hard batches appear
+    ramp_epochs: int = 30         # epochs to ramp hard batch fraction from 0 to max
+    interval: int = 5             # re-mine every N epochs after warmup
+    n_pairs: int = 20             # top-K most confusable sender pairs to track
+    max_hard_fraction: float = 0.5  # maximum fraction of batches that are hard batches
+
+
+class TrainingConfig(BaseModel):
+    """Training loop hyperparameters and checkpointing settings."""
     model_config = ConfigDict(extra="forbid")
 
     epochs: int = 10
@@ -209,24 +125,24 @@ class TrainingConfig(BaseModel):
     save_best: bool = True            # maintain a checkpoint_best.pt tracking lowest val/loss
     early_stopping_patience: int = 0  # epochs without val/loss improvement before stopping; 0 disables
     early_stopping_min_delta: float = 0.0
+    hard_negative_mining: HardNegativeMiningConfig = Field(
+        default_factory=HardNegativeMiningConfig
+    )
 
 
 class WandbConfig(BaseModel):
-    """Weights & Biases experiment tracking settings."""
+    """W&B experiment tracking settings."""
     model_config = ConfigDict(extra="forbid")
 
     project: str = "email-fraud-detection"
-    entity: str | None = None   # wandb team / username; None = personal workspace
-    name: str | None = None     # human-readable run name shown in W&B dashboard
+    entity: str | None = None
+    name: str | None = None
     tags: list[str] = Field(default_factory=list)
     notes: str = ""
 
 
 class RunpodConfig(BaseModel):
-    """Optional RunPod GPU pod settings for remote training.
-
-    Only used when scripts/train.py is invoked with --runpod.
-    """
+    """RunPod GPU pod settings. Only used with --runpod in train.py."""
     model_config = ConfigDict(extra="forbid")
 
     gpu_type: str = "NVIDIA A100-SXM4-80GB"
@@ -234,17 +150,8 @@ class RunpodConfig(BaseModel):
     container_image: str = "runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel-ubuntu22.04"
 
 
-# ---------------------------------------------------------------------------
-# Top-level config
-# ---------------------------------------------------------------------------
-
-
 class ExperimentConfig(BaseModel):
-    """Root config composed from base.yaml + experiment override file.
-
-    confidence_tiers maps a textual k-range (e.g. "1-4") to a tier label
-    (e.g. "low") used by heads and the profile store to qualify predictions.
-    """
+    """Root config. confidence_tiers maps k-ranges (e.g. "1-4") to tier labels."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -265,45 +172,23 @@ class ExperimentConfig(BaseModel):
     )
 
 
-# ---------------------------------------------------------------------------
-# Loader
-# ---------------------------------------------------------------------------
-
 _BASE_YAML = Path(__file__).parent.parent.parent / "configs" / "base.yaml"
 _PROJECT_ROOT = _BASE_YAML.parent.parent
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
-    """Recursively merge *override* into *base*; override keys win.
-
-    Nested dicts are merged recursively rather than replaced wholesale.
-    This lets experiment YAMLs override a single nested key (e.g. training.lr)
-    without repeating all sibling keys from the base config.
-
-    Example:
-        base     = {"training": {"lr": 1e-4, "epochs": 10}}
-        override = {"training": {"lr": 5e-5}}
-        result   = {"training": {"lr": 5e-5, "epochs": 10}}
-    """
+    """Recursively merge override into base; nested dicts are merged, not replaced."""
     merged = base.copy()
     for key, val in override.items():
         if key in merged and isinstance(merged[key], dict) and isinstance(val, dict):
             merged[key] = _deep_merge(merged[key], val)
         else:
-            # Non-dict values (scalars, lists) are replaced wholesale.
             merged[key] = val
     return merged
 
 
 def load_config(path: str) -> ExperimentConfig:
-    """Load and validate an experiment config.
-
-    Strategy:
-    1. Load configs/base.yaml for defaults.
-    2. Load the experiment file at *path*.
-    3. Deep-merge (experiment keys win).
-    4. Parse the merged dict through ExperimentConfig (Pydantic v2).
-    """
+    """Load base.yaml, deep-merge the experiment file on top, validate with Pydantic."""
     base_path = _BASE_YAML
     base_data: dict[str, Any] = {}
     if base_path.exists():
@@ -316,8 +201,8 @@ def load_config(path: str) -> ExperimentConfig:
     merged = _deep_merge(base_data, experiment_data)
     cfg = ExperimentConfig.model_validate(merged)
 
-    # Resolve relative data paths against the project root so train/evaluate work
-    # from any CWD (e.g. on RunPod where the shell may be in /workspace, not the repo).
+    # Resolve relative paths against project root so scripts work from any CWD
+    # (e.g. RunPod where cwd may be /workspace, not the repo root).
     def _abs(p: str) -> str:
         pp = Path(p)
         return str(_PROJECT_ROOT / pp if not pp.is_absolute() else pp)

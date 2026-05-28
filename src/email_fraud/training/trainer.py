@@ -1,29 +1,9 @@
-"""Trainer — contrastive training loop with checkpointing and wandb logging.
+"""Contrastive training loop with checkpointing and W&B logging.
 
-Checkpoint layout under <output_dir>/::
+Checkpoint layout under output_dir/:
+  checkpoint_epoch_NNN.pt, checkpoint_last.pt, checkpoint_best.pt, config.yaml
 
-    checkpoint_epoch_001.pt
-    checkpoint_epoch_002.pt
-    ...
-    checkpoint_last.pt      <- always overwritten with the latest epoch
-    checkpoint_best.pt      <- lowest val/loss seen so far (if save_best=True)
-    config.yaml             <- copy of the experiment config (written by train.py)
-
-Each .pt file contains::
-
-    {
-        "epoch":               int,
-        "model_state_dict":    ...,
-        "optimizer_state_dict",...,
-        "scheduler_state_dict",...,
-        "scaler_state_dict":   ... | None,
-        "best_val_loss":       float,
-    }
-
-Resume::
-
-    Pass resume_from=<path-to-.pt> to __init__; training restarts from
-    epoch+1 with all optimizer/scheduler/scaler states restored.
+Pass resume_from=<path> to __init__ to restart from epoch+1 with full state.
 """
 
 from __future__ import annotations
@@ -38,7 +18,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from email_fraud.config import TrainingConfig, WandbConfig
+from email_fraud.config import PreprocessingConfig, TrainingConfig, WandbConfig
 from email_fraud.encoders.base import BaseEncoder
 from email_fraud.heads.base import BaseHead
 from email_fraud.losses.base import BaseLoss
@@ -59,7 +39,6 @@ def _format_epoch_summary(
     centroid_metrics: dict[str, float],
     pan_metrics: dict[str, float],
 ) -> str:
-    """Compact, human-scannable epoch summary. Full metrics still go to W&B."""
     width = len(str(total_epochs))
     header = f"Epoch {epoch:>{width}}/{total_epochs}"
 
@@ -103,18 +82,7 @@ def _format_epoch_summary(
 
 
 class Trainer:
-    """Contrastive training loop with checkpointing, resume, and wandb logging.
-
-    Args:
-        model:        BaseEncoder to train.
-        loss_fn:      BaseLoss instance.
-        head:         BaseHead for sender profiles (accumulated but not yet scored).
-        config:       TrainingConfig.
-        wandb_config: WandbConfig.
-        output_dir:   Directory to write checkpoints and logs.  Created if absent.
-        resume_from:  Path to a checkpoint .pt file to resume from.
-        device:       Torch device string; auto-detected if None.
-    """
+    """Contrastive training loop with checkpointing, resume, and W&B logging."""
 
     def __init__(
         self,
@@ -129,6 +97,8 @@ class Trainer:
         eval_config_path: str | Path | None = None,
         eval_data_dir: str | None = None,
         centroid_probe: Any = None,
+        preprocessing: PreprocessingConfig | None = None,
+        train_dataset: Any = None,
     ) -> None:
         self.model = model
         self.loss_fn = loss_fn
@@ -136,38 +106,39 @@ class Trainer:
         self.config = config
         self.wandb_config = wandb_config
         self.output_dir = Path(output_dir)
-        # Optional: path to experiment config & processed eval data dir
         self.eval_config_path = Path(eval_config_path) if eval_config_path is not None else None
         self.eval_data_dir = Path(eval_data_dir) if eval_data_dir is not None else None
-        # Optional CentroidProbe for inference-style genuine/other/synthetic AUROCs.
         self.centroid_probe = centroid_probe
-        # Auto-detect GPU if available; fall back to CPU for local development.
+        self.preprocessing = preprocessing
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+        # Extract real-sender texts/ids for hard negative mining (strip synthetic).
+        self._train_texts: list[str] | None = None
+        self._train_sender_ids: list[str] | None = None
+        if train_dataset is not None and hasattr(train_dataset, "_texts"):
+            raw_senders = list(train_dataset._sender_ids_list)
+            self._train_texts = [
+                t for t, s in zip(train_dataset._texts, raw_senders)
+                if not s.endswith("__syn")
+            ]
+            self._train_sender_ids = [s for s in raw_senders if not s.endswith("__syn")]
+        self._hard_pairs: list[tuple[str, str]] = []
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self.model.to(self.device)
 
-        # For LUAR episode pooling, the encoder reduces P*K emails → P*(K/episode_k)
-        # embeddings per batch.  We need to reduce labels by the same factor so
-        # loss shapes stay aligned.  Cache episode_k once at init so the hot path
-        # (per-batch loop) doesn't do attribute lookups.
+        # Cache episode_k so the per-batch loop avoids repeated attribute lookups.
         self._episode_k: int | None = getattr(model, "episode_k", None)
 
-        # Filter to trainable params only — frozen backbone params must not be
-        # passed to the optimizer (they have requires_grad=False and zero grad).
         trainable_params = list(filter(lambda p: p.requires_grad, model.parameters()))
         if not trainable_params:
             raise ValueError(
                 "No trainable parameters found in the encoder. "
                 "Set freeze_backbone=False, add a LoRA config, or set projection_dim."
             )
-        # AdamW decouples weight decay from gradient update, which matters for
-        # transformers where L2 regularization on the Adam adaptive scale is wrong.
         self.optimizer = torch.optim.AdamW(trainable_params, lr=config.lr)
 
-        # GradScaler for automatic mixed precision (AMP): keeps a loss scale factor
-        # that prevents float16 underflow.  Only used on CUDA; CPU doesn't support AMP.
         self.scaler: torch.amp.GradScaler | None = (
             torch.amp.GradScaler()
             if config.mixed_precision and self.device != "cpu"
@@ -176,16 +147,10 @@ class Trainer:
 
         self._start_epoch: int = 1
         self._best_val_loss: float = float("inf")
-        # Counts consecutive epochs without val/loss improvement; reset on improvement.
         self._epochs_since_improvement: int = 0
 
-        # Restore model, optimizer, scaler, and epoch counter from checkpoint.
         if resume_from is not None:
             self._load_checkpoint(Path(resume_from))
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
 
     def train(
         self,
@@ -195,9 +160,6 @@ class Trainer:
         """Run the full training loop from _start_epoch to config.epochs."""
         import wandb
 
-        # wandb.init with resume="allow" means: if a run id already exists in
-        # the output_dir (from a previous run), resume that run's metrics rather
-        # than starting a new one.  This keeps training curves continuous.
         run = wandb.init(
             project=self.wandb_config.project,
             entity=self.wandb_config.entity,
@@ -217,20 +179,16 @@ class Trainer:
             resume="allow",
         )
 
-        # Build the scheduler after init so we know steps_per_epoch.
         scheduler = self._build_scheduler(len(train_loader))
 
         try:
             for epoch in range(self._start_epoch, self.config.epochs + 1):
+                self._maybe_update_hard_negatives(epoch, train_loader)
                 train_loss = self._train_epoch(train_loader, scheduler)
                 val_metrics = self._validate(val_loader)
                 val_loss = val_metrics.get("val/loss", float("inf"))
                 current_lr = self.optimizer.param_groups[0]["lr"]
 
-                # Centroid-style inference probe: enrolls a fixed pool of senders
-                # by averaging held-out embeddings, then scores genuine / other
-                # / synthetic queries against those centroids.  Cheap (re-encodes
-                # ~1k emails) and runs every val epoch.
                 centroid_metrics: dict[str, float] = {}
                 if self.centroid_probe is not None:
                     try:
@@ -240,21 +198,15 @@ class Trainer:
                     except Exception as e:
                         logger.warning("CentroidProbe.evaluate failed: %s", e)
 
-                # Pair-cosine PAN metrics on test_pairs.jsonl every 5 epochs.
-                # Logged into the *same* wandb run (no subprocess).
+                # PAN verification metrics every 5 epochs, logged into the same run.
                 pan_metrics: dict[str, float] = {}
-                if (
-                    epoch % 5 == 0
-                    and self.eval_data_dir is not None
-                ):
+                if epoch % 5 == 0 and self.eval_data_dir is not None:
                     try:
                         pan_metrics = self._inline_pan_eval()
                     except Exception as e:
                         logger.warning("Inline PAN eval failed: %s", e)
 
-                # Pull SyntheticBalancedSampler composition stats if present.
-                # Plain PKSampler doesn't expose pop_epoch_stats — getattr keeps
-                # this opt-in without an isinstance check + import cycle risk.
+                # SyntheticBalancedSampler exposes pop_epoch_stats; plain PKSampler doesn't.
                 sampler_stats: dict[str, float] = {}
                 pop_fn = getattr(
                     getattr(train_loader, "batch_sampler", None),
@@ -320,13 +272,7 @@ class Trainer:
                     break
 
         finally:
-            # Always finish wandb run even if training is interrupted, so the
-            # run appears as "finished" not "crashed" in the wandb dashboard.
             wandb.finish()
-
-    # ------------------------------------------------------------------
-    # Checkpoint I/O
-    # ------------------------------------------------------------------
 
     def _checkpoint_payload(self, epoch: int, scheduler: Any, val_loss: float) -> dict:
         return {
@@ -344,7 +290,6 @@ class Trainer:
         logger.debug("Saved epoch checkpoint: %s", path)
 
     def _save_last_checkpoint(self, epoch: int, val_loss: float) -> None:
-        # Overwritten every epoch — always reflects the most recent state.
         path = self.output_dir / "checkpoint_last.pt"
         torch.save(self._build_payload(epoch, val_loss), path)
 
@@ -354,17 +299,13 @@ class Trainer:
         logger.info("New best val/loss=%.4f at epoch %d → %s", val_loss, epoch, path)
 
     def _build_payload(self, epoch: int, val_loss: float) -> dict:
-        """Assemble the dict that gets torch.save()'d to disk."""
         return {
             "epoch": epoch,
             "val_loss": val_loss,
             "best_val_loss": self._best_val_loss,
             "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
-            # _scheduler_state is updated after every step in _train_epoch
-            # so it's always current when _build_payload is called.
             "scheduler_state_dict": self._scheduler_state,
-            # None when running on CPU (scaler is disabled)
             "scaler_state_dict": self.scaler.state_dict() if self.scaler else None,
         }
 
@@ -372,95 +313,70 @@ class Trainer:
         if not path.exists():
             raise FileNotFoundError(f"Checkpoint not found: {path}")
         logger.info("Resuming from checkpoint: %s", path)
-        # map_location ensures we can load a GPU checkpoint onto CPU
-        # (and vice versa) without error.
         payload = torch.load(path, map_location=self.device)
         self.model.load_state_dict(payload["model_state_dict"])
         self.optimizer.load_state_dict(payload["optimizer_state_dict"])
         if payload.get("scaler_state_dict") and self.scaler is not None:
             self.scaler.load_state_dict(payload["scaler_state_dict"])
         self._best_val_loss = payload.get("best_val_loss", float("inf"))
-        # Resume from the epoch AFTER the saved one.
         self._start_epoch = payload["epoch"] + 1
-        # Stash scheduler state here; it can only be loaded after the scheduler
-        # is built in train() (since we don't know steps_per_epoch yet).
+        # Scheduler state is loaded later in train() once steps_per_epoch is known.
         self._resume_scheduler_state = payload.get("scheduler_state_dict")
         logger.info("Resuming from epoch %d (best val/loss so far: %.4f)",
                     payload["epoch"], self._best_val_loss)
 
     def _prune_old_checkpoints(self, current_epoch: int) -> None:
-        """Delete epoch checkpoints older than the last keep_last_n."""
         n = self.config.keep_last_n
-        # Sort by epoch number (extracted from the filename suffix).
         epoch_ckpts = sorted(
             self.output_dir.glob("checkpoint_epoch_*.pt"),
             key=lambda p: int(p.stem.split("_")[-1]),
         )
-        # Keep only the last n; delete the rest.
         for old in epoch_ckpts[:-n]:
             old.unlink()
             logger.debug("Pruned old checkpoint: %s", old)
 
-    # ------------------------------------------------------------------
-    # Training helpers
-    # ------------------------------------------------------------------
-
-    # Scheduler state is built inside train() and we need it for checkpointing.
-    # We store it as an instance attr after each step so _build_payload can read it.
+    # Updated after every scheduler step so _build_payload can read it without
+    # passing the scheduler object through the call chain.
     _scheduler_state: dict | None = None
     _resume_scheduler_state: dict | None = None
 
     def _train_epoch(self, loader: DataLoader, scheduler: Any) -> float:
-        """Single training epoch; returns mean loss over all batches."""
+        """Single training epoch; returns mean loss."""
         self.model.train()
         total_loss = 0.0
         n_batches = 0
 
         for batch in tqdm(loader, desc="train", leave=False):
-            # batch is an EpisodeBatch (from episode_collate); texts are raw strings,
-            # labels are integer sender ids (assigned by first-appearance order).
             texts: list[str] = batch.texts
             labels: torch.Tensor = batch.labels.to(self.device)
 
-            # Tokenize on CPU (tokenizer is CPU-bound), then move tensors to device.
             token_dict = self.model.tokenize(texts)
             token_dict = {k: v.to(self.device) for k, v in token_dict.items()}
 
             self.optimizer.zero_grad()
 
             if self.scaler is not None:
-                # AMP: run forward pass in float16 for speed, keeping a float32
-                # master copy of weights.  The scaler adjusts the loss scale to
-                # prevent float16 underflow during backward.
                 with torch.amp.autocast(device_type=self.device):
                     embeddings = self.model.encode(**token_dict)
-                    # LUAR episode pooling collapses K emails → 1 embedding per episode,
-                    # so the batch shrinks from P*K rows to P*(K/episode_k) rows.
-                    # Reduce labels by the same stride so shapes stay aligned.
+                    # LUAR episode pooling shrinks P*K rows → P*(K/episode_k);
+                    # stride labels by the same factor to keep shapes aligned.
                     batch_labels = labels[::self._episode_k] if self._episode_k else labels
                     loss = self.loss_fn(embeddings, batch_labels)
                 self.scaler.scale(loss).backward()
-                # Unscale before clip_grad_norm so the norm is in "true" units,
-                # not inflated by the loss scale factor.
+                # Unscale before clip so the norm is in true fp32 units.
                 self.scaler.unscale_(self.optimizer)
                 nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
-                # Standard fp32 path (CPU or if mixed_precision=False).
                 embeddings = self.model.encode(**token_dict)
                 batch_labels = labels[::self._episode_k] if self._episode_k else labels
                 loss = self.loss_fn(embeddings, batch_labels)
                 loss.backward()
-                # Gradient clipping prevents exploding gradients in transformer fine-tuning;
-                # grad_clip=1.0 is a safe default from the original BERT paper.
                 nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
                 self.optimizer.step()
 
-            # Scheduler steps per batch (not per epoch) for smooth LR curves.
             scheduler.step()
-            # Cache scheduler state so _build_payload can read it without
-            # passing the scheduler object around.
             self._scheduler_state = scheduler.state_dict()
             total_loss += loss.item()
             n_batches += 1
@@ -502,12 +418,7 @@ class Trainer:
     def _compute_embedding_metrics(
         self, embs: torch.Tensor, labels: torch.Tensor
     ) -> dict[str, float]:
-        """1-NN accuracy, macro F1, and pairwise authorship AUROC.
-
-        Pairwise AUROC is the standard authorship-verification number: for every
-        (i, j) pair in the val batch (upper triangle), the score is cosine
-        similarity and the label is 1 if same sender, 0 if different.
-        """
+        """1-NN accuracy, macro F1, and pairwise authorship AUROC."""
         import numpy as np
         import torch.nn.functional as F
         from sklearn.metrics import f1_score, roc_auc_score
@@ -546,16 +457,11 @@ class Trainer:
         }
 
     def _inline_pan_eval(self) -> dict[str, float]:
-        """Score test_pairs.jsonl with the current encoder and return PAN metrics.
-
-        Used during training to log AUC / EER / c@1 / F0.5u to the same W&B run
-        each time validation runs (every 5 epochs).  Subprocess-free so no extra
-        wandb.init is created.
-        """
+        """Score test_pairs.jsonl and return PAN metrics (AUC/EER/F1) inline."""
         import json
         import numpy as np
         import torch.nn.functional as F
-        from email_fraud.scoring.metrics import compute_pan_metrics
+        from email_fraud.scoring.metrics import compute_verification_metrics
 
         pairs_path = self.eval_data_dir / "test_pairs.jsonl"
         if not pairs_path.exists():
@@ -573,9 +479,23 @@ class Trainer:
                 label = int(bool(rec.get("same", rec.get("label", 0))))
                 pairs.append((str(text1), str(text2), label))
 
-        flat_texts = [t for p in pairs for t in p[:2]]
+        from email_fraud.data.preprocessing import preprocess
+        flat_texts_raw = [t for p in pairs for t in p[:2]]
+        flat_texts = (
+            [preprocess(t, self.preprocessing) or t for t in flat_texts_raw]
+            if self.preprocessing else flat_texts_raw
+        )
+
         was_training = self.model.training
         self.model.eval()
+
+        # LUAR episode encoders return one embedding per episode of episode_k texts.
+        # Force episode_k=1 so each text gets its own embedding for pair scoring.
+        saved_episode_k: int | None = None
+        if hasattr(self.model, "config") and hasattr(self.model.config, "episode_k"):
+            saved_episode_k = self.model.config.episode_k
+            self.model.config.episode_k = 1
+
         all_embs: list[torch.Tensor] = []
         with torch.no_grad():
             for start in range(0, len(flat_texts), 64):
@@ -583,6 +503,9 @@ class Trainer:
                 tok = self.model.tokenize(batch)
                 tok = {k: v.to(self.device) for k, v in tok.items()}
                 all_embs.append(self.model.encode(**tok).detach().cpu())
+
+        if saved_episode_k is not None:
+            self.model.config.episode_k = saved_episode_k
         if was_training:
             self.model.train()
         embs = torch.cat(all_embs, dim=0)
@@ -592,32 +515,56 @@ class Trainer:
             sim = F.cosine_similarity(embs[i].unsqueeze(0), embs[i + 1].unsqueeze(0)).item()
             scores.append((sim + 1.0) / 2.0)
         labels = np.array([lbl for _, _, lbl in pairs], dtype=np.int64)
-        return compute_pan_metrics(labels, np.array(scores, dtype=np.float64))
+        return compute_verification_metrics(labels, np.array(scores, dtype=np.float64))
+
+    def _maybe_update_hard_negatives(self, epoch: int, train_loader: Any) -> None:
+        """Re-mine hard pairs and update the sampler's batch composition."""
+        hnm = self.config.hard_negative_mining
+        if not hnm.enabled or not self._train_texts:
+            return
+        if epoch < hnm.warmup_epochs:
+            return
+
+        alpha = min(1.0, (epoch - hnm.warmup_epochs) / max(hnm.ramp_epochs, 1))
+        hard_fraction = alpha * hnm.max_hard_fraction
+
+        epochs_since_warmup = epoch - hnm.warmup_epochs
+        if epochs_since_warmup % hnm.interval == 0:
+            from email_fraud.data.hard_negatives import mine_hard_pairs
+
+            logger.info(
+                "Hard negative mining at epoch %d (alpha=%.2f, fraction=%.2f)...",
+                epoch, alpha, hard_fraction,
+            )
+            self._hard_pairs = mine_hard_pairs(
+                self.model,
+                self._train_texts,
+                self._train_sender_ids,
+                self.device,
+                n_pairs=hnm.n_pairs,
+            )
+
+        if not self._hard_pairs:
+            return
+
+        sampler = getattr(train_loader, "batch_sampler", None)
+        if sampler is not None and hasattr(sampler, "set_hard_pairs"):
+            sampler.set_hard_pairs(self._hard_pairs, hard_fraction=hard_fraction)
 
     def _build_scheduler(self, steps_per_epoch: int) -> Any:
-        """Construct the LR scheduler based on config.scheduler.
-
-        All schedulers step per *batch* (not per epoch), so total_steps is
-        steps_per_epoch * epochs.  Warmup linearly ramps LR from ~0 to the
-        initial lr over the first warmup_steps steps — important for transformers
-        to avoid large gradient updates on the cold, randomly-initialized head.
-        """
+        """Build the LR scheduler. All schedulers step per batch, not per epoch."""
         total_steps = steps_per_epoch * self.config.epochs
         warmup = self.config.warmup_steps
 
         if self.config.scheduler == "cosine":
             from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
-            # Warmup phase: linear ramp from near-zero to initial lr.
             warmup_sched = LinearLR(
                 self.optimizer, start_factor=1e-6, end_factor=1.0, total_iters=warmup
             )
-            # Main phase: cosine annealing from initial lr to ~0 over remaining steps.
             cosine_sched = CosineAnnealingLR(
                 self.optimizer, T_max=max(total_steps - warmup, 1)
             )
-            # SequentialLR chains the two: run warmup_sched for `warmup` steps,
-            # then hand off to cosine_sched.
             scheduler = SequentialLR(
                 self.optimizer,
                 schedulers=[warmup_sched, cosine_sched],
@@ -626,14 +573,12 @@ class Trainer:
         elif self.config.scheduler == "linear":
             from torch.optim.lr_scheduler import LinearLR
 
-            # Linear decay from initial lr to 0 over total_steps.
             scheduler = LinearLR(
                 self.optimizer, start_factor=1.0, end_factor=0.0, total_iters=total_steps
             )
         elif self.config.scheduler == "constant":
             from torch.optim.lr_scheduler import ConstantLR
 
-            # No decay — lr stays fixed.  Useful for debugging or short runs.
             scheduler = ConstantLR(self.optimizer, factor=1.0, total_iters=total_steps)
         else:
             raise ValueError(
@@ -641,11 +586,9 @@ class Trainer:
                 "Choose from: 'cosine', 'linear', 'constant'."
             )
 
-        # If resuming, restore the scheduler's step counter so the LR curve
-        # continues from where it left off (not restart from step 0).
         if self._resume_scheduler_state is not None:
             scheduler.load_state_dict(self._resume_scheduler_state)
-            self._resume_scheduler_state = None  # consumed; don't restore twice
+            self._resume_scheduler_state = None
 
         self._scheduler_state = scheduler.state_dict()
         return scheduler
