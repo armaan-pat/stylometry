@@ -18,7 +18,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from email_fraud.config import TrainingConfig, WandbConfig
+from email_fraud.config import PreprocessingConfig, TrainingConfig, WandbConfig
 from email_fraud.encoders.base import BaseEncoder
 from email_fraud.heads.base import BaseHead
 from email_fraud.losses.base import BaseLoss
@@ -97,6 +97,7 @@ class Trainer:
         eval_config_path: str | Path | None = None,
         eval_data_dir: str | None = None,
         centroid_probe: Any = None,
+        preprocessing: PreprocessingConfig | None = None,
     ) -> None:
         self.model = model
         self.loss_fn = loss_fn
@@ -107,6 +108,7 @@ class Trainer:
         self.eval_config_path = Path(eval_config_path) if eval_config_path is not None else None
         self.eval_data_dir = Path(eval_data_dir) if eval_data_dir is not None else None
         self.centroid_probe = centroid_probe
+        self.preprocessing = preprocessing
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -463,9 +465,23 @@ class Trainer:
                 label = int(bool(rec.get("same", rec.get("label", 0))))
                 pairs.append((str(text1), str(text2), label))
 
-        flat_texts = [t for p in pairs for t in p[:2]]
+        from email_fraud.data.preprocessing import preprocess
+        flat_texts_raw = [t for p in pairs for t in p[:2]]
+        flat_texts = (
+            [preprocess(t, self.preprocessing) or t for t in flat_texts_raw]
+            if self.preprocessing else flat_texts_raw
+        )
+
         was_training = self.model.training
         self.model.eval()
+
+        # LUAR episode encoders return one embedding per episode of episode_k texts.
+        # Force episode_k=1 so each text gets its own embedding for pair scoring.
+        saved_episode_k: int | None = None
+        if hasattr(self.model, "config") and hasattr(self.model.config, "episode_k"):
+            saved_episode_k = self.model.config.episode_k
+            self.model.config.episode_k = 1
+
         all_embs: list[torch.Tensor] = []
         with torch.no_grad():
             for start in range(0, len(flat_texts), 64):
@@ -473,6 +489,9 @@ class Trainer:
                 tok = self.model.tokenize(batch)
                 tok = {k: v.to(self.device) for k, v in tok.items()}
                 all_embs.append(self.model.encode(**tok).detach().cpu())
+
+        if saved_episode_k is not None:
+            self.model.config.episode_k = saved_episode_k
         if was_training:
             self.model.train()
         embs = torch.cat(all_embs, dim=0)

@@ -1,7 +1,7 @@
 """PAN-style evaluation script.
 
-Computes AUC, c@1, F0.5u, and EER for a trained model on a held-out
-verification dataset and can optionally report the results to W&B.
+Computes verification metrics for a trained model on a held-out dataset
+and can optionally report the results to W&B.
 
 Usage::
 
@@ -10,11 +10,17 @@ Usage::
         --checkpoint checkpoints/<run_id>/epoch_010.pt \
         --data-dir data/processed/pan
 
-Metrics follow the PAN authorship verification shared task definitions:
+PAN standard metrics:
   - AUC     : area under the ROC curve.
-  - c@1     : PAN's accuracy-with-abstention metric (Peñas & Rodrigo, 2011).
-  - F0.5u   : F-score weighted toward precision (PAN 2020 primary metric).
   - EER     : equal error rate (threshold-free).
+  - c@1     : accuracy-with-abstention (Peñas & Rodrigo, 2011).
+  - F0.5u   : F-score weighted toward precision (PAN 2020 primary metric).
+
+Operational metrics:
+  - pAUC@5%      : partial AUC restricted to FPR ≤ 5%, normalised to [0, 1].
+  - pAUC@10%     : partial AUC restricted to FPR ≤ 10%, normalised to [0, 1].
+  - TPR@FPR=1%   : true positive rate at a 1% false alarm budget.
+  - TPR@FPR=5%   : true positive rate at a 5% false alarm budget.
 """
 
 from __future__ import annotations
@@ -132,11 +138,17 @@ def score_pairs(
     pairs: list[tuple[str, str, int]],
     device: str,
     batch_size: int = 64,
+    preprocessing=None,
 ) -> np.ndarray:
     """Return normalized cosine similarity scores in [0, 1] for each pair."""
     import torch
+    from email_fraud.data.preprocessing import preprocess
 
-    flat_texts = [text for pair in pairs for text in pair[:2]]
+    flat_texts_raw = [text for pair in pairs for text in pair[:2]]
+    if preprocessing is not None:
+        flat_texts = [preprocess(t, preprocessing) or t for t in flat_texts_raw]
+    else:
+        flat_texts = flat_texts_raw
     all_embeddings: list = []
 
     with torch.no_grad():
@@ -196,7 +208,9 @@ def main() -> None:
 
     eval_pairs = load_eval_pairs(str(data_dir))
     labels = np.array([label for _, _, label in eval_pairs], dtype=np.int64)
-    scores = score_pairs(encoder, eval_pairs, device, batch_size=args.batch_size)
+    scores = score_pairs(encoder, eval_pairs, device,
+                         batch_size=args.batch_size,
+                         preprocessing=cfg.data.preprocessing)
     metrics = compute_verification_metrics(labels, scores)
 
     logger.info("Evaluation metrics:")

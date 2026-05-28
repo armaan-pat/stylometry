@@ -189,6 +189,7 @@ class CentroidProbe:
         under coverage/, populated by the helpers below.
         """
         from sklearn.metrics import roc_auc_score
+        from email_fraud.scoring.metrics import compute_pauc, compute_tpr_at_fpr
 
         was_training = encoder.training
         encoder.eval()
@@ -265,6 +266,25 @@ class CentroidProbe:
             out["score/synthetic_harder_than_other"] = (
                 out["score/gap_other"] - out["score/gap_synthetic"]
             )
+
+        # pAUC and TPR@FPR on the hardest task: genuine vs synthetic.
+        if len(genuine_scores) and len(syn_scores):
+            labels = np.concatenate([np.ones_like(genuine_scores), np.zeros_like(syn_scores)])
+            scores = np.concatenate([genuine_scores, syn_scores])
+            out["pauc/genuine_vs_synthetic_5pct"]  = compute_pauc(labels, scores, max_fpr=0.05)
+            out["pauc/genuine_vs_synthetic_10pct"] = compute_pauc(labels, scores, max_fpr=0.10)
+            out["tpr_at_fpr/synthetic_1pct"] = compute_tpr_at_fpr(labels, scores, target_fpr=0.01)
+            out["tpr_at_fpr/synthetic_5pct"] = compute_tpr_at_fpr(labels, scores, target_fpr=0.05)
+
+        # pAUC and TPR@FPR on the pooled task: genuine vs all impostors.
+        if len(genuine_scores) and (len(other_scores) or len(syn_scores)):
+            neg = np.concatenate([other_scores, syn_scores])
+            labels = np.concatenate([np.ones_like(genuine_scores), np.zeros_like(neg)])
+            scores = np.concatenate([genuine_scores, neg])
+            out["pauc/genuine_vs_all_5pct"]  = compute_pauc(labels, scores, max_fpr=0.05)
+            out["pauc/genuine_vs_all_10pct"] = compute_pauc(labels, scores, max_fpr=0.10)
+            out["tpr_at_fpr/all_1pct"] = compute_tpr_at_fpr(labels, scores, target_fpr=0.01)
+            out["tpr_at_fpr/all_5pct"] = compute_tpr_at_fpr(labels, scores, target_fpr=0.05)
 
         # Operating-point reports: at score thresholds 0.5 / 0.8 / 0.95, how
         # the model behaves when used as a "report iff score > τ" verdict
