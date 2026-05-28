@@ -146,14 +146,7 @@ class Trainer:
         )
 
         self._start_epoch: int = 1
-        # Monitored metric: "min" mode starts at +inf, "max" mode at -inf so
-        # the first observation always counts as an improvement.
-        self._monitor_mode: str = getattr(config, "monitor_mode", "min")
-        self._best_metric: float = (
-            float("inf") if self._monitor_mode == "min" else float("-inf")
-        )
-        # Keep the old attribute name alive for checkpoint backward-compat.
-        self._best_val_loss: float = self._best_metric
+        self._best_val_loss: float = float("inf")
         self._epochs_since_improvement: int = 0
 
         if resume_from is not None:
@@ -248,28 +241,17 @@ class Trainer:
                 if epoch % self.config.checkpoint_every_n == 0:
                     self._save_epoch_checkpoint(epoch, val_loss)
                 self._save_last_checkpoint(epoch, val_loss)
-
-                monitor_key = getattr(self.config, "monitor", "val/loss")
-                metric_val = log_payload.get(monitor_key)
-                if metric_val is None:
-                    # Monitored key absent this epoch (e.g. centroid probe disabled
-                    # or eval_every_n step) — skip improvement tracking; don't
-                    # punish the patience counter for missing data.
-                    improved = False
-                else:
-                    metric_val = float(metric_val)
-                    delta = self.config.early_stopping_min_delta
-                    if self._monitor_mode == "min":
-                        improved = metric_val < self._best_metric - delta
-                    else:
-                        improved = metric_val > self._best_metric + delta
+                improved = val_loss < (
+                    self._best_val_loss - self.config.early_stopping_min_delta
+                )
                 if improved:
                     self._epochs_since_improvement = 0
-                    self._best_metric = float(metric_val)
-                    self._best_val_loss = self._best_metric  # legacy mirror
                     if self.config.save_best:
+                        self._best_val_loss = val_loss
                         self._save_best_checkpoint(epoch, val_loss)
-                elif metric_val is not None:
+                    else:
+                        self._best_val_loss = val_loss
+                else:
                     self._epochs_since_improvement += 1
                 if self.config.keep_last_n > 0:
                     self._prune_old_checkpoints(epoch)
@@ -280,60 +262,17 @@ class Trainer:
                     >= self.config.early_stopping_patience
                 ):
                     logger.info(
-                        "Early stopping at epoch %d: no %s improvement "
+                        "Early stopping at epoch %d: no val/loss improvement "
                         "for %d epochs (best=%.4f).",
                         epoch,
-                        getattr(self.config, "monitor", "val/loss"),
                         self._epochs_since_improvement,
-                        self._best_metric,
+                        self._best_val_loss,
                     )
                     wandb.log({"early_stopped_at_epoch": epoch})
                     break
 
-            # Final-epoch score dump for offline threshold analysis.
-            self._dump_final_scores()
-
         finally:
             wandb.finish()
-
-    def _dump_final_scores(self) -> None:
-        """Save the most recent CentroidProbe outputs for offline analysis.
-
-        Writes two files when available:
-          scores_final.json — canonical-fn score arrays + per-fn score arrays
-                              for every score function the probe evaluated
-          probe_raw.json    — raw (cos_sim, spread) pairs per query pool, so
-                              scripts/analyze_thresholds.py can replay arbitrary
-                              score functions without re-running the model
-
-        Silent if the probe never ran or stashed nothing.
-        """
-        import json
-
-        probe = self.centroid_probe
-        if probe is None:
-            return
-
-        scores = getattr(probe, "_last_scores", None)
-        raw = getattr(probe, "_last_raw", None)
-
-        if scores:
-            path = self.output_dir / "scores_final.json"
-            try:
-                with path.open("w") as fh:
-                    json.dump(scores, fh)
-                logger.info("Dumped final scores to %s", path)
-            except Exception as e:
-                logger.warning("Failed to dump scores: %s", e)
-
-        if raw:
-            path = self.output_dir / "probe_raw.json"
-            try:
-                with path.open("w") as fh:
-                    json.dump(raw, fh)
-                logger.info("Dumped probe raw geometry to %s", path)
-            except Exception as e:
-                logger.warning("Failed to dump probe raw geometry: %s", e)
 
     def _checkpoint_payload(self, epoch: int, scheduler: Any, val_loss: float) -> dict:
         return {

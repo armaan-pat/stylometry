@@ -292,11 +292,6 @@ def _build_centroid_probe(cfg, train_dataset, val_dataset, output_dir):
         except Exception as e:
             logger.warning("Could not load synthetic dataset for probe: %s", e)
 
-    # Resolve the list of score functions to evaluate every probe step. If the
-    # user gave eval_score_fns, use that; otherwise just evaluate the head's
-    # default (cfg.head.score_fn). The first entry in the list is the
-    # "canonical" one whose metrics are logged without a prefix.
-    score_fns = list(cfg.head.eval_score_fns) if cfg.head.eval_score_fns else [cfg.head.score_fn]
     return CentroidProbe(
         train_texts=train_texts,
         train_senders=train_senders,
@@ -305,7 +300,6 @@ def _build_centroid_probe(cfg, train_dataset, val_dataset, output_dir):
         synthetic_texts=syn_texts or None,
         synthetic_source_senders=syn_sources or None,
         confidence_tiers=cfg.confidence_tiers,
-        score_fns=score_fns,
         seed=0,
     )
 

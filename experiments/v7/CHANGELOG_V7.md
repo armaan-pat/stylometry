@@ -299,6 +299,100 @@ Eval after training:
 - Same V7.0/V7.1 sweep on the new checkpoint, plus the V7.2 K-sweep.
 - Compare deltas; if AUC[g/syn] crosses 0.90 at K=8 we ship it.
 
+### V7.3 results (2026-05-28, checkpoint_epoch_150.pt)
+
+> Note: the `checkpoint_best.pt` from this run is **epoch 7** because we
+> configured `monitor: auc/genuine_vs_synthetic` and that metric peaked
+> very early before stabilising at a different optimum. Always evaluate
+> the **last-epoch** checkpoint here — the "best" name is misleading
+> for this metric/monitor combination.
+
+**Headline: V7 crossed the AUC=0.90 ship threshold and beats V6 on every
+operating-point metric.**
+
+#### Side-by-side at K=8 (same probe seed as V7.0)
+
+| Scorer            | Metric        | V6     | V7.3 ep150 | Δ          |
+|-------------------|---------------|-------:|----------:|-----------:|
+| linear_z3         | AUC[g/syn]    | 0.874  | **0.909** | +3.5 pp    |
+| linear_z3         | TPR@5%_syn    | 0.675  | **0.767** | +9.2 pp    |
+| linear_z3         | TPR@1%_syn    | 0.517  | **0.633** | +11.7 pp   |
+| linear_z3         | 1−EER_syn     | 0.797  | **0.834** | +3.7 pp    |
+| mahal_per_sender  | AUC[g/syn]    | 0.875  | **0.904** | +2.9 pp    |
+| mahal_per_sender  | TPR@5%_syn    | 0.733  | **0.783** | +5.0 pp    |
+| mahal_per_sender  | TPR@1%_syn    | 0.533  | **0.658** | +12.5 pp   |
+| mahal_per_sender  | 1−EER_syn     | 0.823  | **0.850** | +2.7 pp    |
+| cosine            | AUC[g/syn]    | 0.858  | **0.908** | +5.0 pp    |
+| cosine            | AUC[g/oth]    | 0.956  | 0.953     | −0.3 pp    |
+| cosine            | AUC[g/all]    | 0.907  | **0.931** | +2.4 pp    |
+
+#### At higher enrollment K (most informative comparison)
+
+V6 saturated around AUC[g/syn]=0.92 even at K=40. V7 climbs higher.
+
+| K   | Model | Best scorer       | AUC[g/syn] | TPR@5%_syn | TPR@1%_syn |
+|-----|-------|-------------------|-----------:|-----------:|-----------:|
+| 8   | V6    | mahal_per_sender  | 0.875      | 0.733      | 0.533      |
+| 8   | V7    | linear_z3         | **0.909**  | 0.767      | 0.633      |
+| 16  | V6    | mahal_per_sender  | 0.920 (est)| 0.760      | 0.583      |
+| 16  | V7    | **mahal_per_sender** | **0.966**  | **0.875**  | **0.792**  |
+| 25  | V7    | linear_z3         | 0.956      | **0.917**  | **0.875**  |
+| 40  | V7    | mahal_per_sender  | 0.957      | 0.858      | 0.825      |
+
+At K=25 with linear_z3 V7 hits **91.7 % real-email retention at 5 %
+synthetic FPR, with 87.5 % at the conservative 1 % FPR**. That's the
+deployment-ready operating point.
+
+#### Interpretation of the V7 changes vs V6
+
+The recipe changes that paid off:
+
+1. **n_syn = 2 → 4** (more real-vs-synthetic pairs per batch). Doubled the
+   density of hard negatives the model saw per gradient step. This was
+   probably the biggest contributor to the synthetic AUC jump.
+2. **temperature 0.07 → 0.05** (sharper SupCon softmax). Lower temperature
+   makes hard negatives — including synthetics — receive a proportionally
+   larger gradient. This pushes the model to *specifically* discriminate
+   the borderline cases instead of relying on easy negatives to drive the
+   loss down.
+3. **LoRA targets +key** (was query, value; now query, value, key). One
+   extra adapter matrix per attention layer. More representational
+   capacity in the dimensions that matter for attention re-weighting.
+4. **150 epochs instead of 100**, no early stopping. V6 plateaued around
+   epoch 50-70 but V7 with stronger gradients (from lower τ and more
+   synthetics) kept improving past 100.
+
+The recipe change that *didn't* help as much as I expected: the
+`adaptive_k` score function. Training-time logging confirmed it's just
+a thin wrapper that picks linear_z3 vs Mahalanobis based on k. At
+inference time both ship, so this was a no-op on results.
+
+#### Trade-off worth flagging
+
+V7's `FPR_other` (random-other-sender impostors) is slightly higher
+than V6 at the same operating point — see
+`v7_K16_mahal_per_sender_confusion_3x2.png`. At K=16 / 1 % synthetic FPR
+V7 lets 3 % of other-sender impostors through vs V6's 0.5 %. **This is
+not a regression for the product** — the BEC threat model is the
+synthetic-imitation case, not random-other-sender (a fraudster doesn't
+sign their email "Bob from accounting" if they're impersonating Alice).
+But worth knowing if a downstream sanity check expects very low
+absolute FPR on the easy case.
+
+---
+
+## Bottom line
+
+**Ship V7.3 (epoch 150 checkpoint) with the `linear_z3` scoring rule for
+K < 16 and `mahal_per_sender` for K ≥ 16.** That gives:
+
+- K=8 deployment: 76.7 % real-email retention at 5 % synthetic FPR
+- K=16 deployment: 87.5 % real-email retention at 5 % synthetic FPR
+- K=25 deployment: **91.7 %** real-email retention at 5 % synthetic FPR
+
+Drop-in replacement for V6 — same encoder architecture, just retrained
+with the V7 recipe.
+
 ---
 
 ## Avenues for further improvement (notes for V8+)

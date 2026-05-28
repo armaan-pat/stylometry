@@ -1,0 +1,54 @@
+# V7 eval-time config — same encoder architecture as v7_luar_lora_syn_mahal
+# but with fields the current source-tree pydantic schema accepts.
+#
+# Used by scripts/eval_v7_scoring.py, eval_v7_k_sweep.py, plot_confusion.py
+# against the checkpoint trained from the original (richer) v7 config. The
+# encoder architecture is what matters for state_dict compatibility; everything
+# else is just describing data + preprocessing.
+
+encoder:
+  model_name_or_path: rrivera1849/LUAR-MUD
+  pooling: luar_episode
+  freeze_backbone: false
+  lora:
+    r: 16
+    alpha: 32
+    target_modules:
+      - query
+      - value
+      - key
+    dropout: 0.05
+  max_length: 512
+  projection_dim: 128
+  episode_k: 4
+  trust_remote_code: true
+
+loss:
+  name: supcon
+  temperature: 0.05
+
+head:
+  name: prototypical
+
+data:
+  train_senders: 100
+  emails_per_sender_k: 8
+  val_split: 0.1
+  test_split: 0.1
+  augmentation:
+    synthetic_path: data/synthetic/enron_synthetic
+    n_syn_per_batch: 4
+
+training:
+  epochs: 150
+  batch_size: 64
+  lr: 2.0e-4
+  scheduler: cosine
+  warmup_steps: 200
+  grad_clip: 1.0
+  mixed_precision: true
+
+wandb:
+  name: v7_luar_lora_syn_mahal
+  tags: [v7-ablation]
+  notes: "V7 eval-time config (architecture-only)."
