@@ -77,10 +77,26 @@ class CentroidProbe:
         n_other_queries: int = 200,
         n_synthetic_queries: int = 200,
         confidence_tiers: dict[str, str] | None = None,
+        score_fns: list[str] | None = None,
         seed: int = 0,
     ) -> None:
+        from email_fraud.scoring.score_functions import (
+            DEFAULT_SCORE_FNS,
+            SCORE_FNS,
+        )
+
         self.confidence_tiers = confidence_tiers
         self._seed = seed
+        # List of score functions to evaluate every step. The first one wins
+        # the un-prefixed metric names (auc/genuine_vs_all, etc.) so existing
+        # dashboards keep working unchanged.
+        fns = list(score_fns) if score_fns else list(DEFAULT_SCORE_FNS)
+        unknown = [f for f in fns if f not in SCORE_FNS]
+        if unknown:
+            raise KeyError(
+                f"Unknown score_fns {unknown}. Available: {sorted(SCORE_FNS)}"
+            )
+        self._score_fns = fns
         rng = random.Random(seed)
 
         sender_to_texts: dict[str, list[str]] = defaultdict(list)
@@ -188,8 +204,7 @@ class CentroidProbe:
         Threshold-band metrics live under threshold_{τ}/ and coverage metrics
         under coverage/, populated by the helpers below.
         """
-        from sklearn.metrics import roc_auc_score
-        from email_fraud.scoring.metrics import compute_pauc, compute_tpr_at_fpr
+        from email_fraud.scoring.score_functions import resolve as _resolve_score_fn
 
         was_training = encoder.training
         encoder.eval()
@@ -203,99 +218,156 @@ class CentroidProbe:
         head = PrototypicalHead(confidence_tiers=self.confidence_tiers)
         head.fit(enrol_emb, d.enrollment_senders)
 
-        # Genuine: score each held-out email against its true sender's centroid.
-        genuine_scores = np.array([
-            head.score(emb, sid)["score"]
-            for emb, sid in zip(gen_emb, d.genuine_senders)
-        ])
-        # Other-sender impostors: score each impostor email against a *random*
-        # profiled sender (we know they're not that person — splits are
-        # sender-disjoint).  This is the easy negative.
+        # Pull raw (cos_sim, spread) per query once; each score_fn is applied
+        # in a tight inner loop below so we don't pay the encoding cost N times.
+        def _raw_pairs(embs, sender_iter):
+            out = []
+            for emb, sid in zip(embs, sender_iter):
+                r = head.score_raw(emb, sid)
+                out.append((float(r["cos_sim"]), float(r["spread"])))
+            return out
+
+        gen_raw = _raw_pairs(gen_emb, d.genuine_senders)
+
         rng = random.Random(self._seed)
-        other_scores = np.array([])
+        oth_raw: list[tuple[float, float]] = []
         if oth_emb is not None and len(oth_emb) > 0:
             assigned = [rng.choice(self._profile_senders) for _ in range(len(oth_emb))]
-            other_scores = np.array([
-                head.score(emb, sid)["score"] for emb, sid in zip(oth_emb, assigned)
-            ])
-        # Synthetic hard negatives: score against the *real* source sender's
-        # centroid (the LLM was prompted to imitate that person).  The model
-        # passes if it scores synthetic-Alice low against Alice's centroid.
-        syn_scores = np.array([])
+            oth_raw = _raw_pairs(oth_emb, assigned)
+
+        syn_raw: list[tuple[float, float]] = []
         if syn_emb is not None and len(syn_emb) > 0:
-            syn_scores = np.array([
-                head.score(emb, sid)["score"]
-                for emb, sid in zip(syn_emb, d.synthetic_source_senders)
-            ])
+            syn_raw = _raw_pairs(syn_emb, d.synthetic_source_senders)
 
         if was_training:
             encoder.train()
 
-        out: dict[str, float] = {
-            "score/mean_genuine": float(genuine_scores.mean()) if len(genuine_scores) else 0.0,
-            "score/mean_other": float(other_scores.mean()) if len(other_scores) else 0.0,
-            "score/mean_synthetic": float(syn_scores.mean()) if len(syn_scores) else 0.0,
-            "probe/n_genuine_queries": float(len(genuine_scores)),
-            "probe/n_other_queries": float(len(other_scores)),
-            "probe/n_synthetic_queries": float(len(syn_scores)),
+        # Stash raw geometry so the trainer can dump it for offline score-fn
+        # experimentation in scripts/analyze_thresholds.py.
+        self._last_raw = {
+            "genuine": gen_raw,
+            "other": oth_raw,
+            "synthetic": syn_raw,
+            "score_fns_evaluated": list(self._score_fns),
         }
 
-        # AUROC: genuine (label=1) vs other (label=0). Higher score = more genuine.
-        if len(genuine_scores) and len(other_scores):
-            labels = np.concatenate([np.ones_like(genuine_scores), np.zeros_like(other_scores)])
-            scores = np.concatenate([genuine_scores, other_scores])
-            out["auc/genuine_vs_other"] = float(roc_auc_score(labels, scores))
-            out["score/gap_other"] = float(genuine_scores.mean() - other_scores.mean())
+        # Apply each configured score function. The first one gets the
+        # un-prefixed metric names so legacy dashboards keep working; the rest
+        # get f"{fn}/" prefixes.
+        out: dict[str, float] = {}
+        per_fn_scores: dict[str, dict[str, np.ndarray]] = {}
+        for i, fn_name in enumerate(self._score_fns):
+            fn = _resolve_score_fn(fn_name)
+            g = np.array([fn(c, s) for c, s in gen_raw])
+            o = np.array([fn(c, s) for c, s in oth_raw])
+            sn = np.array([fn(c, s) for c, s in syn_raw])
+            per_fn_scores[fn_name] = {"genuine": g, "other": o, "synthetic": sn}
+            prefix = "" if i == 0 else f"{fn_name}/"
+            out.update(_metrics_for_score_set(g, o, sn, prefix=prefix))
 
-        if len(genuine_scores) and len(syn_scores):
-            labels = np.concatenate([np.ones_like(genuine_scores), np.zeros_like(syn_scores)])
-            scores = np.concatenate([genuine_scores, syn_scores])
-            out["auc/genuine_vs_synthetic"] = float(roc_auc_score(labels, scores))
-            out["score/gap_synthetic"] = float(genuine_scores.mean() - syn_scores.mean())
+        # Keep the canonical (first score_fn) arrays available to the trainer's
+        # final dump for backward compatibility with scores_final.json consumers.
+        canonical = per_fn_scores[self._score_fns[0]]
+        genuine_scores = canonical["genuine"]
+        other_scores = canonical["other"]
+        syn_scores = canonical["synthetic"]
 
-        # Combined: genuine vs (other ∪ synthetic) — the "all impostors" pool.
-        if len(genuine_scores) and (len(other_scores) or len(syn_scores)):
-            neg = np.concatenate([other_scores, syn_scores])
-            labels = np.concatenate([np.ones_like(genuine_scores), np.zeros_like(neg)])
-            scores = np.concatenate([genuine_scores, neg])
-            out["auc/genuine_vs_all"] = float(roc_auc_score(labels, scores))
+        out["probe/n_genuine_queries"] = float(len(genuine_scores))
+        out["probe/n_other_queries"] = float(len(other_scores))
+        out["probe/n_synthetic_queries"] = float(len(syn_scores))
 
-        # Difficulty differential: positive ⇒ synthetic is harder than other-sender,
-        # which is what we want from a useful hard-negative augmentation.
-        if "score/gap_other" in out and "score/gap_synthetic" in out:
-            out["score/synthetic_harder_than_other"] = (
-                out["score/gap_other"] - out["score/gap_synthetic"]
-            )
-
-        # pAUC and TPR@FPR on the hardest task: genuine vs synthetic.
-        if len(genuine_scores) and len(syn_scores):
-            labels = np.concatenate([np.ones_like(genuine_scores), np.zeros_like(syn_scores)])
-            scores = np.concatenate([genuine_scores, syn_scores])
-            out["pauc/genuine_vs_synthetic_5pct"]  = compute_pauc(labels, scores, max_fpr=0.05)
-            out["pauc/genuine_vs_synthetic_10pct"] = compute_pauc(labels, scores, max_fpr=0.10)
-            out["tpr_at_fpr/synthetic_1pct"] = compute_tpr_at_fpr(labels, scores, target_fpr=0.01)
-            out["tpr_at_fpr/synthetic_5pct"] = compute_tpr_at_fpr(labels, scores, target_fpr=0.05)
-
-        # pAUC and TPR@FPR on the pooled task: genuine vs all impostors.
-        if len(genuine_scores) and (len(other_scores) or len(syn_scores)):
-            neg = np.concatenate([other_scores, syn_scores])
-            labels = np.concatenate([np.ones_like(genuine_scores), np.zeros_like(neg)])
-            scores = np.concatenate([genuine_scores, neg])
-            out["pauc/genuine_vs_all_5pct"]  = compute_pauc(labels, scores, max_fpr=0.05)
-            out["pauc/genuine_vs_all_10pct"] = compute_pauc(labels, scores, max_fpr=0.10)
-            out["tpr_at_fpr/all_1pct"] = compute_tpr_at_fpr(labels, scores, target_fpr=0.01)
-            out["tpr_at_fpr/all_5pct"] = compute_tpr_at_fpr(labels, scores, target_fpr=0.05)
-
-        # Operating-point reports: at score thresholds 0.5 / 0.8 / 0.95, how
-        # the model behaves when used as a "report iff score > τ" verdict
-        # system.  Higher τ ⇒ more confident report, lower coverage.
-        out.update(_threshold_band_metrics(genuine_scores, other_scores, syn_scores))
-
-        # Coverage at accuracy targets: largest fraction of the query stream we
-        # can "report" on (top-k by confidence) while keeping accuracy ≥ target.
-        out.update(_coverage_at_accuracy(genuine_scores, other_scores, syn_scores))
+        # Stash canonical-fn raw scores (legacy consumers) + per-fn scores for
+        # offline replay. analyze_thresholds.py reads scores_per_fn if present.
+        self._last_scores = {
+            "genuine": genuine_scores.tolist(),
+            "other": other_scores.tolist(),
+            "synthetic": syn_scores.tolist(),
+            "score_fn": self._score_fns[0],
+            "scores_per_fn": {
+                name: {k: v.tolist() for k, v in pool.items()}
+                for name, pool in per_fn_scores.items()
+            },
+        }
 
         return out
+
+
+def _metrics_for_score_set(
+    genuine: np.ndarray,
+    other: np.ndarray,
+    synthetic: np.ndarray,
+    prefix: str = "",
+) -> dict[str, float]:
+    """Compute the full metric bundle for one (genuine, other, synth) score set.
+
+    Pulled out of evaluate() so the same bundle can be computed for every
+    score function configured on the probe. `prefix` is prepended to every key
+    (e.g. "sigmoid_z/") so multiple score functions don't collide on the same
+    metric name in the W&B log.
+    """
+    from sklearn.metrics import roc_auc_score
+    from email_fraud.scoring.metrics import compute_pauc, compute_tpr_at_fpr
+
+    out: dict[str, float] = {}
+    out[f"{prefix}score/mean_genuine"] = float(genuine.mean()) if len(genuine) else 0.0
+    out[f"{prefix}score/mean_other"] = float(other.mean()) if len(other) else 0.0
+    out[f"{prefix}score/mean_synthetic"] = float(synthetic.mean()) if len(synthetic) else 0.0
+
+    if len(genuine) and len(other):
+        labels = np.concatenate([np.ones_like(genuine), np.zeros_like(other)])
+        scores = np.concatenate([genuine, other])
+        out[f"{prefix}auc/genuine_vs_other"] = float(roc_auc_score(labels, scores))
+        out[f"{prefix}score/gap_other"] = float(genuine.mean() - other.mean())
+
+    if len(genuine) and len(synthetic):
+        labels = np.concatenate([np.ones_like(genuine), np.zeros_like(synthetic)])
+        scores = np.concatenate([genuine, synthetic])
+        out[f"{prefix}auc/genuine_vs_synthetic"] = float(roc_auc_score(labels, scores))
+        out[f"{prefix}score/gap_synthetic"] = float(genuine.mean() - synthetic.mean())
+
+    if len(genuine) and (len(other) or len(synthetic)):
+        neg = np.concatenate([other, synthetic])
+        labels = np.concatenate([np.ones_like(genuine), np.zeros_like(neg)])
+        scores = np.concatenate([genuine, neg])
+        out[f"{prefix}auc/genuine_vs_all"] = float(roc_auc_score(labels, scores))
+
+    if f"{prefix}score/gap_other" in out and f"{prefix}score/gap_synthetic" in out:
+        out[f"{prefix}score/synthetic_harder_than_other"] = (
+            out[f"{prefix}score/gap_other"] - out[f"{prefix}score/gap_synthetic"]
+        )
+
+    if len(genuine) and len(synthetic):
+        labels = np.concatenate([np.ones_like(genuine), np.zeros_like(synthetic)])
+        scores = np.concatenate([genuine, synthetic])
+        out[f"{prefix}pauc/genuine_vs_synthetic_5pct"] = compute_pauc(labels, scores, max_fpr=0.05)
+        out[f"{prefix}pauc/genuine_vs_synthetic_10pct"] = compute_pauc(labels, scores, max_fpr=0.10)
+        out[f"{prefix}tpr_at_fpr/synthetic_1pct"] = compute_tpr_at_fpr(labels, scores, target_fpr=0.01)
+        out[f"{prefix}tpr_at_fpr/synthetic_5pct"] = compute_tpr_at_fpr(labels, scores, target_fpr=0.05)
+
+    if len(genuine) and (len(other) or len(synthetic)):
+        neg = np.concatenate([other, synthetic])
+        labels = np.concatenate([np.ones_like(genuine), np.zeros_like(neg)])
+        scores = np.concatenate([genuine, neg])
+        out[f"{prefix}pauc/genuine_vs_all_5pct"] = compute_pauc(labels, scores, max_fpr=0.05)
+        out[f"{prefix}pauc/genuine_vs_all_10pct"] = compute_pauc(labels, scores, max_fpr=0.10)
+        out[f"{prefix}tpr_at_fpr/all_1pct"] = compute_tpr_at_fpr(labels, scores, target_fpr=0.01)
+        out[f"{prefix}tpr_at_fpr/all_5pct"] = compute_tpr_at_fpr(labels, scores, target_fpr=0.05)
+
+    # Fixed-threshold band metrics (mostly diagnostic — see _fpr_anchored_thresholds
+    # for the operationally meaningful version).
+    band = _threshold_band_metrics(genuine, other, synthetic)
+    out.update({f"{prefix}{k}": v for k, v in band.items()})
+
+    # FPR-anchored operating points (the deployment-relevant numbers).
+    fpr_op = _fpr_anchored_thresholds(genuine, other, synthetic)
+    out.update({f"{prefix}{k}": v for k, v in fpr_op.items()})
+
+    # Coverage-at-accuracy (score-fn-dependent because it uses the 0.5
+    # midpoint as the "indecision" point — only meaningful for [0, 1] fns).
+    cov = _coverage_at_accuracy(genuine, other, synthetic)
+    out.update({f"{prefix}{k}": v for k, v in cov.items()})
+
+    return out
 
 
 _THRESHOLDS = (0.5, 0.8, 0.95)
@@ -362,6 +434,64 @@ def _threshold_band_metrics(
             correct = float((genuine > tau).sum()) + float((impostors <= tau).sum())
             out[f"{group}/accuracy"] = correct / (n_g + n_i)
 
+    return out
+
+
+_FPR_TARGETS = (0.01, 0.05, 0.10)
+
+
+def _fpr_anchored_thresholds(
+    genuine: np.ndarray,
+    other: np.ndarray,
+    synthetic: np.ndarray,
+) -> dict[str, float]:
+    """Find τ such that FPR == target, report recall/precision/τ at that point.
+
+    Replaces the fixed-score 0.5/0.8/0.95 view, which is broken for the current
+    PrototypicalHead score = max(0, 1 - z/3): score > 0.95 requires z < 0.15,
+    i.e. the query has to be ~6x closer to its centroid than the average
+    enrollment email — statistically impossible, so threshold_0.95/* is always
+    zero regardless of training quality.
+
+    For each target FPR we find τ via the (n+1)-th impostor quantile (so that
+    exactly n impostors exceed τ, giving the target rate) and report the
+    operating point: threshold value, recall, precision, FPR_synthetic,
+    FPR_other. Two anchor sets:
+
+        fpr_overall/* — τ from the pooled impostor distribution
+        fpr_synthetic/* — τ from the synthetic-only distribution (hardest)
+    """
+    out: dict[str, float] = {}
+    if len(genuine) == 0:
+        return out
+
+    impostors = np.concatenate([other, synthetic]) if (len(other) or len(synthetic)) else np.array([])
+
+    def _report(prefix: str, neg: np.ndarray) -> None:
+        if len(neg) == 0:
+            return
+        # Score above which exactly target_fpr fraction of impostors fall.
+        # quantile(neg, 1-fpr) gives that boundary, exclusive — guarantees we
+        # never report > target FPR on this sample, at the cost of slightly
+        # under-shooting on small samples.
+        for fpr in _FPR_TARGETS:
+            tau = float(np.quantile(neg, 1.0 - fpr))
+            group = f"{prefix}/fpr_{fpr:.2f}"
+            recall = float((genuine > tau).mean())
+            tp = float((genuine > tau).sum())
+            fp = float((neg > tau).sum())
+            precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            out[f"{group}/threshold"] = tau
+            out[f"{group}/recall"] = recall
+            out[f"{group}/precision"] = precision
+            if len(other):
+                out[f"{group}/fpr_other"] = float((other > tau).mean())
+            if len(synthetic):
+                out[f"{group}/fpr_synthetic"] = float((synthetic > tau).mean())
+
+    _report("op/all", impostors)
+    if len(synthetic):
+        _report("op/synthetic", synthetic)
     return out
 
 

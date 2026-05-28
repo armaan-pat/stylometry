@@ -55,6 +55,14 @@ class HeadConfig(BaseModel):
     name: str = "prototypical"
     distance: str = "cosine"
     shrinkage: str = "ledoit_wolf"
+    # Default score function used at inference. CentroidProbe can additionally
+    # evaluate a list of score_fns for side-by-side comparison.
+    score_fn: str = "linear_z3"
+    # List of score functions to evaluate every probe step. The first entry is
+    # the "canonical" one whose metrics are logged without a prefix (so
+    # existing dashboards keep working); the rest get prefixed with f"{fn}/".
+    # Empty list ⇒ just use [score_fn].
+    eval_score_fns: list[str] = Field(default_factory=list)
 
 
 class PreprocessingConfig(BaseModel):
@@ -122,8 +130,10 @@ class TrainingConfig(BaseModel):
     output_dir: str = "runs"          # root directory for all experiment outputs
     checkpoint_every_n: int = 1       # save a checkpoint every N epochs
     keep_last_n: int = 3              # keep only the N most recent epoch checkpoints (0 = keep all)
-    save_best: bool = True            # maintain a checkpoint_best.pt tracking lowest val/loss
-    early_stopping_patience: int = 0  # epochs without val/loss improvement before stopping; 0 disables
+    save_best: bool = True            # maintain a checkpoint_best.pt tracking the monitored metric
+    monitor: str = "val/loss"         # key in the merged log payload to track (e.g. auc/genuine_vs_all)
+    monitor_mode: str = "min"         # "min" or "max" — direction in which the monitored metric improves
+    early_stopping_patience: int = 0  # epochs without monitor improvement before stopping; 0 disables
     early_stopping_min_delta: float = 0.0
     hard_negative_mining: HardNegativeMiningConfig = Field(
         default_factory=HardNegativeMiningConfig

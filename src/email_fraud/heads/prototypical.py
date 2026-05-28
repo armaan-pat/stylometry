@@ -65,6 +65,7 @@ class PrototypicalHead(BaseHead):
         self,
         confidence_tiers: dict[str, str] | None = None,
         distance: str = "cosine",
+        score_fn: str = "linear_z3",
     ) -> None:
         super().__init__()
         self.confidence_tiers = confidence_tiers or {
@@ -74,6 +75,11 @@ class PrototypicalHead(BaseHead):
             "25+": "very_high",
         }
         self.distance = distance
+        # Resolve once at construction so .score() is a tight inner loop. The
+        # registry validates the name (KeyError if unknown).
+        from email_fraud.scoring.score_functions import resolve as _resolve_score_fn
+        self.score_fn_name = score_fn
+        self._score_fn = _resolve_score_fn(score_fn)
         # In-memory dict of profiles; keyed by sender_id string.
         self._profiles: dict[str, dict[str, Any]] = {}
 
@@ -137,45 +143,60 @@ class PrototypicalHead(BaseHead):
                 prof["spread"] = float((1.0 - sims).mean())
                 prof["k"] = new_k
 
-    def score(
+    def score_raw(
         self,
         query: torch.Tensor,
         sender_id: str,
     ) -> dict[str, object]:
-        """Return cosine-similarity score, tier, and abstain flag.
+        """Return the underlying geometry: cos_sim, spread, tier.
 
-        Score interpretation:
-          - 1.0 : query is as close to centroid as typical emails (z ≈ 0)
-          - 0.5 : 1.5 standard deviations away from centroid
-          - 0.0 : 3+ standard deviations away (very atypical)
+        Lets callers swap score functions without touching the head — useful
+        for the centroid probe, which evaluates multiple scoring variants per
+        run, and for offline replay in analyze_thresholds.py.
         """
         query = query.detach().cpu().squeeze()  # ensure (d,) shape
 
         if sender_id not in self._profiles:
-            # Unknown sender: cannot score, must abstain.
-            return {"score": 0.0, "tier": "unknown", "abstain": True}
+            return {
+                "cos_sim": float("nan"),
+                "spread": float("nan"),
+                "tier": "unknown",
+                "abstain": True,
+            }
 
         prof = self._profiles[sender_id]
         centroid: torch.Tensor = prof["centroid"]
         spread: float = prof["spread"]
         k: int = prof["k"]
 
-        # Cosine similarity ∈ [-1, 1]; 1 = identical direction, 0 = orthogonal.
         cos_sim = float(F.cosine_similarity(query.unsqueeze(0), centroid.unsqueeze(0)))
-        # Cosine distance ∈ [0, 2]; 0 = same direction.
-        deviation = (1.0 - cos_sim)
-
-        # Z-score: how many "spreads" away from the centroid is this query?
-        # max(spread, 1e-9) avoids division by zero for perfectly consistent senders.
-        z = deviation / max(spread, 1e-9)
-        # Linear mapping: z=0 → score=1.0, z=3 → score=0.0, z>3 → clamped at 0.
-        normalized_score = max(0.0, 1.0 - z / 3.0)
-
         tier = self._k_to_tier(k)
-        # Abstain if the profile is built from too few emails to be reliable.
-        abstain = tier == "low"
+        return {
+            "cos_sim": cos_sim,
+            "spread": spread,
+            "tier": tier,
+            "abstain": tier == "low",
+        }
 
-        return {"score": normalized_score, "tier": tier, "abstain": abstain}
+    def score(
+        self,
+        query: torch.Tensor,
+        sender_id: str,
+    ) -> dict[str, object]:
+        """Return score under the configured score_fn, tier, and abstain flag.
+
+        See email_fraud.scoring.score_functions for the variants. The default
+        (linear_z3) preserves the historical "1.0 = typical, 0.0 = z≥3" mapping.
+        """
+        raw = self.score_raw(query, sender_id)
+        if raw["tier"] == "unknown":
+            return {"score": 0.0, "tier": "unknown", "abstain": True}
+        normalized_score = self._score_fn(float(raw["cos_sim"]), float(raw["spread"]))
+        return {
+            "score": normalized_score,
+            "tier": raw["tier"],
+            "abstain": raw["abstain"],
+        }
 
     def save(self, path: str) -> None:
         # Convert tensors to numpy for pickle portability across PyTorch versions.

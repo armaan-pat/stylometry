@@ -39,8 +39,10 @@ training:
   warmup_steps: 200
   grad_clip: 1.0
   mixed_precision: true
-  early_stopping_patience: 0
-  early_stopping_min_delta: 1.0e-4
+  monitor: auc/genuine_vs_all
+  monitor_mode: max
+  early_stopping_patience: 8
+  early_stopping_min_delta: 1.0e-3
   keep_last_n: 1
 
 wandb:
