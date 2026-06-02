@@ -140,10 +140,13 @@ class PrototypicalHead(BaseHead):
                 # cosine_similarity returns values in [-1, 1]; 1 - sim gives distance in [0, 2].
                 sims = F.cosine_similarity(embs, centroid.unsqueeze(0))
                 spread = float((1.0 - sims).mean())
+                from email_fraud.scoring.score_functions import linear_z3 as _lz3
+                enroll_scores = sorted(_lz3(float(s), spread) for s in sims.tolist())
                 self._profiles[sid] = {
                     "centroid": centroid,
                     "spread": spread,
                     "k": len(idx),
+                    "enroll_scores": enroll_scores,
                 }
                 if self.store_embeddings:
                     # Keep raw enrollment embeddings on the profile so we can
@@ -161,13 +164,11 @@ class PrototypicalHead(BaseHead):
                 prof["centroid"] = (
                     prof["centroid"] * old_k + embs.sum(dim=0)
                 ) / new_k
-                # Recompute spread only from the incoming batch against the updated
-                # centroid (not a full recomputation — approximation is acceptable).
-                all_embs = embs
-                sims = F.cosine_similarity(
-                    all_embs, prof["centroid"].unsqueeze(0)
-                )
-                prof["spread"] = float((1.0 - sims).mean())
+                # Running weighted average so spread reflects all emails seen, not just the
+                # most recent batch (which would reset the estimate on every incremental call).
+                sims = F.cosine_similarity(embs, prof["centroid"].unsqueeze(0))
+                batch_spread = float((1.0 - sims).mean())
+                prof["spread"] = (prof["spread"] * old_k + batch_spread * len(idx)) / new_k
                 prof["k"] = new_k
                 if self.store_embeddings:
                     # Append; covariance will be re-fit lazily on next mahalanobis call.
@@ -345,6 +346,20 @@ class PrototypicalHead(BaseHead):
                 "Re-fit with store_embeddings=True (default)."
             )
         return self._mahalanobis_distance(query.detach().cpu().squeeze(), prof)
+
+    def adaptive_threshold(self, sender_id: str, percentile: float = 20.0) -> float:
+        """Score at `percentile` of this sender's enrollment distribution.
+
+        Use as a per-sender decision threshold instead of a global constant.
+        Falls back to 0.5 for unknown senders or profiles without enrollment scores.
+        """
+        prof = self._profiles.get(sender_id)
+        if not prof or "enroll_scores" not in prof:
+            return 0.5
+        scores = prof["enroll_scores"]
+        import bisect as _bisect
+        idx = max(0, min(len(scores) - 1, int(len(scores) * percentile / 100.0)))
+        return scores[idx]
 
     # ------------------------------------------------------------------
     # Private helpers

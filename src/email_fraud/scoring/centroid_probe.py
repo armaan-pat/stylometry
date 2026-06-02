@@ -291,6 +291,80 @@ class CentroidProbe:
 
         return out
 
+    @torch.no_grad()
+    def diagnose(self, encoder, device: str, batch_size: int = 32) -> list[dict]:
+        """Return per-query records for failure-mode analysis.
+
+        Each record contains: type (genuine/other/synthetic), label (1/0),
+        actual_sender, target_sender (centroid scored against), text,
+        word_count, char_count, score, tier, abstain, cos_sim, spread, k.
+        Save to CSV and pass to scripts/analyze_failures.py.
+        """
+        from email_fraud.scoring.score_functions import resolve as _resolve_fn
+
+        was_training = encoder.training
+        encoder.eval()
+        d = self._data
+
+        enrol_emb = _encode(encoder, d.enrollment_texts, device, batch_size)
+        gen_emb   = _encode(encoder, d.genuine_texts,    device, batch_size)
+        oth_emb   = _encode(encoder, d.other_texts,      device, batch_size) if d.other_texts   else None
+        syn_emb   = _encode(encoder, d.synthetic_texts,  device, batch_size) if d.synthetic_texts else None
+
+        head = PrototypicalHead(confidence_tiers=self.confidence_tiers)
+        head.fit(enrol_emb, d.enrollment_senders)
+
+        score_fn = _resolve_fn(self._score_fns[0])
+        rng = random.Random(self._seed)
+
+        records: list[dict] = []
+
+        for emb, text, sid in zip(gen_emb, d.genuine_texts, d.genuine_senders):
+            raw = head.score_raw(emb, sid)
+            cos_sim = float(raw["cos_sim"])
+            spread  = float(raw["spread"])
+            score   = score_fn(cos_sim, spread)
+            records.append({
+                "type": "genuine", "label": 1,
+                "actual_sender": sid, "target_sender": sid,
+                "text": text, "word_count": len(text.split()), "char_count": len(text),
+                "score": score, "tier": raw["tier"], "abstain": raw["abstain"],
+                "cos_sim": cos_sim, "spread": spread, "k": head._profiles.get(sid, {}).get("k"),
+            })
+
+        if oth_emb is not None and len(oth_emb) > 0:
+            assigned = [rng.choice(self._profile_senders) for _ in range(len(oth_emb))]
+            for emb, text, target in zip(oth_emb, d.other_texts, assigned):
+                raw = head.score_raw(emb, target)
+                cos_sim = float(raw["cos_sim"])
+                spread  = float(raw["spread"])
+                score   = score_fn(cos_sim, spread)
+                records.append({
+                    "type": "other", "label": 0,
+                    "actual_sender": "?", "target_sender": target,
+                    "text": text, "word_count": len(text.split()), "char_count": len(text),
+                    "score": score, "tier": raw["tier"], "abstain": raw["abstain"],
+                    "cos_sim": cos_sim, "spread": spread, "k": head._profiles.get(target, {}).get("k"),
+                })
+
+        if syn_emb is not None and len(syn_emb) > 0:
+            for emb, text, sid in zip(syn_emb, d.synthetic_texts, d.synthetic_source_senders):
+                raw = head.score_raw(emb, sid)
+                cos_sim = float(raw["cos_sim"])
+                spread  = float(raw["spread"])
+                score   = score_fn(cos_sim, spread)
+                records.append({
+                    "type": "synthetic", "label": 0,
+                    "actual_sender": f"{sid}__syn", "target_sender": sid,
+                    "text": text, "word_count": len(text.split()), "char_count": len(text),
+                    "score": score, "tier": raw["tier"], "abstain": raw["abstain"],
+                    "cos_sim": cos_sim, "spread": spread, "k": head._profiles.get(sid, {}).get("k"),
+                })
+
+        if was_training:
+            encoder.train()
+        return records
+
 
 def _metrics_for_score_set(
     genuine: np.ndarray,
