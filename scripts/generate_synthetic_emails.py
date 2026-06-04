@@ -304,6 +304,11 @@ def _load_model(model_name: str, load_in_4bit: bool):
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    # Decoder-only models MUST left-pad for batched generation: right-padding
+    # makes the model attend to pad tokens and corrupts the output (HF warns
+    # about this). It also keeps the uniform `output_ids[prompt_len:]` slice in
+    # _generate_batch correct for every row in the batch.
+    tokenizer.padding_side = "left"
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         quantization_config=quant_cfg,

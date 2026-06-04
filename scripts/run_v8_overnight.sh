@@ -39,6 +39,13 @@ ROOT="$(pwd)"
 export WANDB_RUN_GROUP="${WANDB_RUN_GROUP:-v8-syn-compare}"   # the campaign
 export WANDB_PROJECT="${WANDB_PROJECT:-email-fraud-detection}"
 GEN_MODEL="${GEN_MODEL:-mistralai/Mistral-7B-Instruct-v0.3}"
+# Mistral-7B is ~14GB in fp16 — fits the A40's 48GB with room to spare, and
+# fp16 generation is far faster than bitsandbytes 4-bit (which only helps on
+# <16GB cards). Set GEN_4BIT=1 only on a small GPU. GEN_BATCH controls batch size.
+GEN_4BIT="${GEN_4BIT:-0}"
+GEN_BATCH="${GEN_BATCH:-16}"
+GEN_FLAGS="--batch-size $GEN_BATCH"
+[ "$GEN_4BIT" = "1" ] && GEN_FLAGS="$GEN_FLAGS --load-in-4bit"
 GEN_CONFIG="configs/experiments/v7_luar_lora_syn_mahal_eval.yaml"  # arch-only, loads cleanly
 SYN_V1="data/synthetic/enron_synthetic_v1"     # control: cross-register-fraction 0.0
 SYN_V2="data/synthetic/enron_synthetic_v2"     # treatment: cross-register-fraction 0.4
@@ -88,7 +95,7 @@ else
     python scripts/generate_synthetic_emails.py \
     --config "$GEN_CONFIG" --model "$GEN_MODEL" \
     --n-per-sender 10 --cross-register-fraction 0.0 \
-    --output "$SYN_V1" --load-in-4bit --wandb
+    --output "$SYN_V1" $GEN_FLAGS --wandb
 fi
 
 if [ -d "$SYN_V2" ]; then
@@ -98,7 +105,7 @@ else
     python scripts/generate_synthetic_emails.py \
     --config "$GEN_CONFIG" --model "$GEN_MODEL" \
     --n-per-sender 15 --cross-register-fraction 0.4 \
-    --output "$SYN_V2" --load-in-4bit --wandb
+    --output "$SYN_V2" $GEN_FLAGS --wandb
 fi
 
 # =============================================================================
