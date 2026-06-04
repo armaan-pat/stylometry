@@ -38,6 +38,8 @@ ROOT="$(pwd)"
 # -----------------------------------------------------------------------------
 export WANDB_RUN_GROUP="${WANDB_RUN_GROUP:-v8-syn-compare}"   # the campaign
 export WANDB_PROJECT="${WANDB_PROJECT:-email-fraud-detection}"
+# Keep model downloads OFF the tiny 20G root overlay — /workspace has TBs free.
+export HF_HOME="${HF_HOME:-/workspace/.hf_cache}"
 GEN_MODEL="${GEN_MODEL:-mistralai/Mistral-7B-Instruct-v0.3}"
 GEN_CONFIG="configs/experiments/v7_luar_lora_syn_mahal_eval.yaml"  # arch-only, loads cleanly
 SYN_V1="data/synthetic/enron_synthetic_v1"     # control: cross-register-fraction 0.0
