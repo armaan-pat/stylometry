@@ -57,11 +57,13 @@ run_step() {   # run_step <name> <cmd...>
   echo "   cmd: $*"
   echo "   log: $log"
   echo "=================================================================="
-  if "$@" > "$log" 2>&1; then
+  # tee → live terminal output AND a persistent per-stage log. pipefail (set at
+  # the top) makes the pipeline's exit status reflect the command, not tee.
+  if "$@" 2>&1 | tee "$log"; then
     echo "<< [$(date '+%F %T')] OK     $name"
     return 0
   else
-    local rc=$?
+    local rc=${PIPESTATUS[0]}
     echo "!! [$(date '+%F %T')] FAILED $name (exit $rc) — continuing. See $log"
     return $rc
   fi
@@ -82,19 +84,21 @@ test -d data/processed/enron \
 if [ -d "$SYN_V1" ]; then
   echo "skip gen v1 — $SYN_V1 exists"
 else
-  run_step 01_gen_synv1 python scripts/generate_synthetic_emails.py \
+  run_step 01_gen_synv1 env WANDB_JOB_TYPE=generate WANDB_NAME=gen-synv1 \
+    python scripts/generate_synthetic_emails.py \
     --config "$GEN_CONFIG" --model "$GEN_MODEL" \
     --n-per-sender 10 --cross-register-fraction 0.0 \
-    --output "$SYN_V1" --load-in-4bit
+    --output "$SYN_V1" --load-in-4bit --wandb
 fi
 
 if [ -d "$SYN_V2" ]; then
   echo "skip gen v2 — $SYN_V2 exists"
 else
-  run_step 02_gen_synv2 python scripts/generate_synthetic_emails.py \
+  run_step 02_gen_synv2 env WANDB_JOB_TYPE=generate WANDB_NAME=gen-synv2 \
+    python scripts/generate_synthetic_emails.py \
     --config "$GEN_CONFIG" --model "$GEN_MODEL" \
     --n-per-sender 15 --cross-register-fraction 0.4 \
-    --output "$SYN_V2" --load-in-4bit
+    --output "$SYN_V2" --load-in-4bit --wandb
 fi
 
 # =============================================================================

@@ -469,6 +469,9 @@ def main() -> None:
     parser.add_argument("--batch-size",    type=int,   default=4)
     parser.add_argument("--max-senders",   type=int,   default=None)
     parser.add_argument("--seed",          type=int,   default=42)
+    parser.add_argument("--wandb",         action="store_true",
+                        help="Log acceptance stats + dataset composition to W&B. "
+                             "Honors WANDB_RUN_GROUP / WANDB_JOB_TYPE / WANDB_NAME.")
     args = parser.parse_args()
 
     rng = random.Random(args.seed)
@@ -616,6 +619,66 @@ def main() -> None:
         "context_register": out_context_regs,
     }).save_to_disk(str(out_path))
     print(f"Saved to {out_path}")
+
+    if args.wandb:
+        _log_wandb(cfg, args, out_path, {
+            "total_generated": total_generated,
+            "total_accepted": total_accepted,
+            "overall_accept_rate": (total_accepted / total_generated) if total_generated else 0.0,
+            "hard_generated": hard_gen,
+            "hard_accepted": hard_acc,
+            "hard_accept_rate": hard_rate,
+            "cross_generated": cross_generated,
+            "cross_accepted": cross_accepted,
+            "cross_accept_rate": cross_rate,
+            "n_senders": len(senders),
+            "n_per_sender": args.n_per_sender,
+            "cross_register_fraction": args.cross_register_fraction,
+            "dataset_rows": len(out_texts),
+            "n_cross_register_rows": cross_accepted,
+            "n_hard_neg_rows": total_accepted - cross_accepted,
+        })
+
+
+def _log_wandb(cfg, args, out_path, stats: dict) -> None:
+    """Log generation stats as one W&B run. Sectioning (group/job_type/name)
+    comes from WANDB_* env vars — we don't pass those kwargs so wandb reads them
+    natively. A 'syn-vN' tag is derived from the output dir name so the run is
+    filterable alongside the matching train/probe/ablate runs."""
+    import re
+    import wandb
+
+    stem = out_path.name
+    m = re.search(r"v(\d+)", stem)
+    ver_tag = f"syn-v{m.group(1)}" if m else stem
+    run = wandb.init(
+        project=cfg.wandb.project,
+        entity=cfg.wandb.entity,
+        tags=[*cfg.wandb.tags, "synthetic-generation", ver_tag],
+        notes=f"Synthetic generation → {out_path} "
+              f"(cross_register_fraction={args.cross_register_fraction}, model={args.model})",
+        config={
+            "output": str(out_path),
+            "model": args.model,
+            "n_per_sender": args.n_per_sender,
+            "cross_register_fraction": args.cross_register_fraction,
+            "min_words": args.min_words,
+            "max_overlap": args.max_overlap,
+            "seed": args.seed,
+        },
+    )
+    wandb.summary.update(stats)
+    table = wandb.Table(
+        columns=["mode", "generated", "accepted", "accept_rate"],
+        data=[
+            ["hard_neg", stats["hard_generated"], stats["hard_accepted"], stats["hard_accept_rate"]],
+            ["cross_register", stats["cross_generated"], stats["cross_accepted"], stats["cross_accept_rate"]],
+            ["overall", stats["total_generated"], stats["total_accepted"], stats["overall_accept_rate"]],
+        ],
+    )
+    wandb.log({"acceptance": table})
+    print(f"[wandb] logged generation stats to run {run.name} (tags: {ver_tag}, synthetic-generation)")
+    run.finish()
 
 
 if __name__ == "__main__":
