@@ -161,7 +161,18 @@ def _run_training(cfg, EncoderClass, LossClass, HeadClass, args, output_dir: Pat
             if k in LossClass.__init__.__code__.co_varnames
         }
     )
-    head = HeadClass(confidence_tiers=cfg.confidence_tiers)
+    head = HeadClass(
+        **{
+            k: v
+            for k, v in {
+                "confidence_tiers": cfg.confidence_tiers,
+                "score_fn": cfg.head.score_fn,
+                "mahalanobis_min_k": cfg.head.mahalanobis_min_k,
+                "ridge": cfg.head.ridge,
+            }.items()
+            if k in HeadClass.__init__.__code__.co_varnames
+        }
+    )
 
     DatasetClass = resolve("dataset", cfg.data.dataset)
     train_dataset = DatasetClass(cfg.data, split="train")
@@ -300,6 +311,7 @@ def _build_centroid_probe(cfg, train_dataset, val_dataset, output_dir):
         synthetic_texts=syn_texts or None,
         synthetic_source_senders=syn_sources or None,
         confidence_tiers=cfg.confidence_tiers,
+        score_fns=cfg.head.eval_score_fns or None,
         seed=0,
     )
 

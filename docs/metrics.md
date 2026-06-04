@@ -4,8 +4,9 @@ A complete, self-contained reference for every metric this project reports
 to Weights & Biases during training. Read top-to-bottom the first time,
 then use the table of contents below as a lookup index.
 
-> This document is paired with the model architecture summary in
-> `summary.md` and the V7 research log in `experiments/v7/CHANGELOG_V7.md`.
+> This document is paired with [architecture.md](architecture.md) (how the model
+> works) and the V7 research log in
+> [experiments/v7/CHANGELOG_V7.md](../experiments/v7/CHANGELOG_V7.md).
 
 ---
 

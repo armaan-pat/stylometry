@@ -32,8 +32,8 @@ Add a new encoder with `@register("encoder", "key")` and import it in `encoders/
 **Losses** (`src/email_fraud/losses/`) — `SupConLoss` (Khosla et al. NeurIPS 2020),
 `TripletLoss` (Hermans et al.). Both require PKSampler.
 
-**Heads** (`src/email_fraud/heads/`) — `PrototypicalHead`: centroid + cosine z-score,
-online `fit()`. `CrossEncoderHead`: reranker stub, not yet implemented.
+**Heads** (`src/email_fraud/heads/`) — `PrototypicalHead`: centroid + cosine z-score
+(plus per-sender Ledoit-Wolf Mahalanobis from V7), online `fit()`.
 
 **Data** (`src/email_fraud/data/`) — `PKSampler` produces P×K batches;
 `SyntheticBalancedSampler` guarantees n_syn synthetic–real pairs per batch.
@@ -70,11 +70,18 @@ override only the fields that differ from `base.yaml`.
 | 10–24 | `high` | |
 | 25+ | `very_high` | |
 
-## TODOs
+## Documentation
+
+| Doc | Contents |
+|-----|----------|
+| [docs/architecture.md](docs/architecture.md) | How the system works end-to-end: batching, LUAR pooling, SupCon, enrollment & scoring |
+| [docs/results.md](docs/results.md) | Experimental results, current gaps, prioritized next steps |
+| [docs/metrics.md](docs/metrics.md) | Every W&B metric the trainer logs and how to read it |
+| [docs/v6_vs_v7_memo.md](docs/v6_vs_v7_memo.md), [experiments/v7/CHANGELOG_V7.md](experiments/v7/CHANGELOG_V7.md) | V7 research logs |
+
+## Open TODOs
 
 | File | What's missing |
 |------|----------------|
-| `encoders/hf_encoder.py` | luar_episode path needs testing with a real LUAR checkpoint |
-| `heads/prototypical.py` | Ledoit-Wolf Mahalanobis scoring |
-| `heads/cross_encoder.py` | Full reranker |
-| `profiles/store.py` | Mahalanobis with pgvector backend |
+| `training/trainer.py` | Full PAN metrics (AUC/EER/c@1/F0.5u) in validation, not just `evaluate.py` |
+| `profiles/store.py` | pgvector backend for production-scale profiles |

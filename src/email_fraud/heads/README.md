@@ -92,23 +92,11 @@ A stub for future Mahalanobis distance scoring with Ledoit-Wolf covariance shrin
 
 ---
 
-### `cross_encoder.py` — `CrossEncoderHead`
-
-**Cross-encoder reranker — not yet implemented.** Registered as `"cross_encoder"`.
-
-Intended as a second-stage scorer after the prototypical head shortlists anomalous emails. Unlike a bi-encoder, a cross-encoder concatenates the query and a profile email and lets attention flow between them — more accurate but ~10× slower.
-
-**Current status**: all methods raise `NotImplementedError`. The class is registered so it can be referenced in YAML configs without changing other code.
-
-Reference: Nogueira & Cho, arXiv:1901.04085.
-
----
-
 ## Configuration reference
 
 ```yaml
 head:
-  name: prototypical    # prototypical | cross_encoder
+  name: prototypical    # prototypical (only implemented head)
   distance: cosine      # cosine (only implemented option)
   shrinkage: ledoit_wolf  # for future Mahalanobis support
 ```

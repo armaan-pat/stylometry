@@ -1,0 +1,79 @@
+# V7 — ORIGINAL synthetic arm of the syn-v1-vs-syn-v2 comparison.
+#
+# Identical training recipe to v7_luar_lora_syn_mahal.yaml. The ONLY thing that
+# differs from v7_synv2.yaml is the synthetic dataset it points at:
+#   syn-v1 = regenerated with --cross-register-fraction 0.0 (all hard negatives,
+#            reproducing the pre-CHANGELOG generation behaviour — no cross-register
+#            positives). This is the control.
+# Keep every other knob fixed so the comparison isolates the dataset change.
+
+encoder:
+  model_name_or_path: rrivera1849/LUAR-MUD
+  pooling: luar_episode
+  freeze_backbone: false
+  lora:
+    r: 16
+    alpha: 32
+    target_modules:
+      - query
+      - value
+      - key
+    dropout: 0.05
+  max_length: 512
+  projection_dim: 128
+  episode_k: 4
+  trust_remote_code: true
+
+loss:
+  name: supcon
+  temperature: 0.05
+
+head:
+  name: prototypical
+  score_fn: adaptive_k
+  eval_score_fns:
+    - linear_z3
+    - cosine
+    - sigmoid_z
+
+data:
+  train_senders: 100
+  emails_per_sender_k: 8
+  val_split: 0.1
+  test_split: 0.1
+  augmentation:
+    synthetic_path: data/synthetic/enron_synthetic_v1
+    n_syn_per_batch: 4
+
+training:
+  epochs: 150
+  batch_size: 64
+  lr: 2.0e-4
+  scheduler: cosine
+  warmup_steps: 200
+  grad_clip: 1.0
+  mixed_precision: true
+  monitor: auc/genuine_vs_synthetic
+  monitor_mode: max
+  early_stopping_patience: 0
+  early_stopping_min_delta: 1.0e-3
+  keep_last_n: 1
+  hard_negative_mining:
+    enabled: true
+    warmup_epochs: 20
+    ramp_epochs: 30
+    interval: 5
+    n_pairs: 20
+    max_hard_fraction: 0.5
+
+wandb:
+  name: v7-synv1
+  tags:
+    - luar
+    - lora
+    - supcon
+    - episode-pooling
+    - v7
+    - syn-v1
+    - syn-compare
+  notes: "V7 syn-compare CONTROL arm: original synthetic (cross-register-fraction 0.0, hard-neg only)."

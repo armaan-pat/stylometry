@@ -146,7 +146,19 @@ class Trainer:
         )
 
         self._start_epoch: int = 1
-        self._best_val_loss: float = float("inf")
+        # Best-checkpoint selection + early stopping track config.monitor in the
+        # direction given by config.monitor_mode ("min"/"max"). Default is
+        # val/loss/min for back-compat, but operational runs should monitor a
+        # low-FPR CentroidProbe metric (the loss is a known non-monotonic proxy).
+        self._monitor: str = config.monitor
+        self._monitor_mode: str = config.monitor_mode
+        if self._monitor_mode not in {"min", "max"}:
+            raise ValueError(
+                f"monitor_mode must be 'min' or 'max', got {self._monitor_mode!r}"
+            )
+        self._best_monitor: float = (
+            float("inf") if self._monitor_mode == "min" else float("-inf")
+        )
         self._epochs_since_improvement: int = 0
 
         if resume_from is not None:
@@ -225,6 +237,18 @@ class Trainer:
                     **sampler_stats,
                     **{f"test/{k}": v for k, v in pan_metrics.items()},
                 }
+
+                # Pull the monitored metric from the full payload. It may live
+                # in val_metrics (val/loss), centroid_metrics (auc/*, pauc/*,
+                # tpr_at_fpr/*), or the test/* PAN block. If it's absent this
+                # epoch (e.g. PAN metric on a non-multiple-of-5 epoch, or the
+                # probe raised), we can't judge improvement — leave best/patience
+                # untouched rather than guessing.
+                monitor_val = log_payload.get(self._monitor)
+                log_payload["monitor/value"] = (
+                    float(monitor_val) if monitor_val is not None else float("nan")
+                )
+                log_payload["monitor/best"] = self._best_monitor
                 wandb.log(log_payload)
                 logger.info(
                     "%s",
@@ -241,17 +265,19 @@ class Trainer:
                 if epoch % self.config.checkpoint_every_n == 0:
                     self._save_epoch_checkpoint(epoch, val_loss)
                 self._save_last_checkpoint(epoch, val_loss)
-                improved = val_loss < (
-                    self._best_val_loss - self.config.early_stopping_min_delta
-                )
+
+                improved = self._is_improvement(monitor_val)
                 if improved:
                     self._epochs_since_improvement = 0
+                    self._best_monitor = float(monitor_val)
                     if self.config.save_best:
-                        self._best_val_loss = val_loss
                         self._save_best_checkpoint(epoch, val_loss)
-                    else:
-                        self._best_val_loss = val_loss
-                else:
+                        logger.info(
+                            "New best %s=%.4f (mode=%s) at epoch %d → checkpoint_best.pt",
+                            self._monitor, self._best_monitor, self._monitor_mode, epoch,
+                        )
+                elif monitor_val is not None:
+                    # Only count a real (present-but-not-better) epoch against patience.
                     self._epochs_since_improvement += 1
                 if self.config.keep_last_n > 0:
                     self._prune_old_checkpoints(epoch)
@@ -262,11 +288,12 @@ class Trainer:
                     >= self.config.early_stopping_patience
                 ):
                     logger.info(
-                        "Early stopping at epoch %d: no val/loss improvement "
+                        "Early stopping at epoch %d: no %s improvement "
                         "for %d epochs (best=%.4f).",
                         epoch,
+                        self._monitor,
                         self._epochs_since_improvement,
-                        self._best_val_loss,
+                        self._best_monitor,
                     )
                     wandb.log({"early_stopped_at_epoch": epoch})
                     break
@@ -274,15 +301,19 @@ class Trainer:
         finally:
             wandb.finish()
 
-    def _checkpoint_payload(self, epoch: int, scheduler: Any, val_loss: float) -> dict:
-        return {
-            "epoch": epoch,
-            "best_val_loss": self._best_val_loss,
-            "model_state_dict": self.model.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
-            "scheduler_state_dict": self._scheduler_state,
-            "scaler_state_dict": self.scaler.state_dict() if self.scaler else None,
-        }
+    def _is_improvement(self, monitor_val: float | None) -> bool:
+        """True iff monitor_val beats the running best by at least min_delta.
+
+        Returns False when the metric is absent this epoch (can't judge) so
+        neither the best checkpoint nor the early-stopping counter moves on a
+        blind epoch.
+        """
+        if monitor_val is None:
+            return False
+        delta = self.config.early_stopping_min_delta
+        if self._monitor_mode == "max":
+            return monitor_val > self._best_monitor + delta
+        return monitor_val < self._best_monitor - delta
 
     def _save_epoch_checkpoint(self, epoch: int, val_loss: float) -> None:
         path = self.output_dir / f"checkpoint_epoch_{epoch:03d}.pt"
@@ -302,7 +333,9 @@ class Trainer:
         return {
             "epoch": epoch,
             "val_loss": val_loss,
-            "best_val_loss": self._best_val_loss,
+            "monitor": self._monitor,
+            "monitor_mode": self._monitor_mode,
+            "best_monitor": self._best_monitor,
             "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self._scheduler_state,
@@ -318,12 +351,19 @@ class Trainer:
         self.optimizer.load_state_dict(payload["optimizer_state_dict"])
         if payload.get("scaler_state_dict") and self.scaler is not None:
             self.scaler.load_state_dict(payload["scaler_state_dict"])
-        self._best_val_loss = payload.get("best_val_loss", float("inf"))
+        # Restore the running best. New checkpoints store "best_monitor"; older
+        # ones only have "best_val_loss" — fall back to it only when the current
+        # monitor is still val/loss, otherwise start fresh in the right direction.
+        if "best_monitor" in payload:
+            self._best_monitor = payload["best_monitor"]
+        elif self._monitor == "val/loss" and "best_val_loss" in payload:
+            self._best_monitor = payload["best_val_loss"]
+        # else: keep the +/-inf init from __init__ for the new monitor.
         self._start_epoch = payload["epoch"] + 1
         # Scheduler state is loaded later in train() once steps_per_epoch is known.
         self._resume_scheduler_state = payload.get("scheduler_state_dict")
-        logger.info("Resuming from epoch %d (best val/loss so far: %.4f)",
-                    payload["epoch"], self._best_val_loss)
+        logger.info("Resuming from epoch %d (best %s so far: %.4f)",
+                    payload["epoch"], self._monitor, self._best_monitor)
 
     def _prune_old_checkpoints(self, current_epoch: int) -> None:
         n = self.config.keep_last_n

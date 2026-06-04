@@ -49,12 +49,22 @@ class LossConfig(BaseModel):
 
 
 class HeadConfig(BaseModel):
-    """Scoring head config. shrinkage is a stub (Mahalanobis not yet implemented)."""
+    """Scoring head config."""
     model_config = ConfigDict(extra="forbid")
 
     name: str = "prototypical"
     distance: str = "cosine"
     shrinkage: str = "ledoit_wolf"
+    # Production score function the deployed head uses (see scoring/score_functions.py
+    # for the (cos, spread) registry, plus "mahalanobis"/"adaptive_k" handled in the head).
+    score_fn: str = "linear_z3"
+    # Extra score functions the CentroidProbe evaluates every epoch alongside
+    # score_fn, for apples-to-apples comparison in W&B. The first metric set
+    # (score_fn itself) keeps the un-prefixed metric names. See scoring ablation.
+    eval_score_fns: list[str] = Field(default_factory=list)
+    # k below which mahalanobis/adaptive_k modes fall back to cosine (Σ too noisy).
+    mahalanobis_min_k: int = 5
+    ridge: float = 1e-4
 
 
 class PreprocessingConfig(BaseModel):
@@ -122,8 +132,15 @@ class TrainingConfig(BaseModel):
     output_dir: str = "runs"          # root directory for all experiment outputs
     checkpoint_every_n: int = 1       # save a checkpoint every N epochs
     keep_last_n: int = 3              # keep only the N most recent epoch checkpoints (0 = keep all)
-    save_best: bool = True            # maintain a checkpoint_best.pt tracking lowest val/loss
-    early_stopping_patience: int = 0  # epochs without val/loss improvement before stopping; 0 disables
+    save_best: bool = True            # maintain a checkpoint_best.pt tracking the monitored metric
+    # Metric that drives checkpoint_best.pt selection AND early stopping. Any
+    # key present in the per-epoch log payload works: "val/loss" (default,
+    # back-compat), or an operational metric from the CentroidProbe such as
+    # "auc/genuine_vs_synthetic", "pauc/genuine_vs_synthetic_5pct", or
+    # "tpr_at_fpr/synthetic_1pct". Use monitor_mode to say which direction is better.
+    monitor: str = "val/loss"
+    monitor_mode: str = "min"         # "min" (lower is better, e.g. loss) or "max" (e.g. AUC)
+    early_stopping_patience: int = 0  # epochs without monitor improvement before stopping; 0 disables
     early_stopping_min_delta: float = 0.0
     hard_negative_mining: HardNegativeMiningConfig = Field(
         default_factory=HardNegativeMiningConfig
