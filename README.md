@@ -74,6 +74,7 @@ override only the fields that differ from `base.yaml`.
 
 | Doc | Contents |
 |-----|----------|
+| [docs/EXPERIMENT_STATUS.md](docs/EXPERIMENT_STATUS.md) | **Start here** — consolidated landscape: what's been tested (V2→V8), best results, what worked/didn't, how to run, time estimates, prioritized next steps. Regenerate tables with `scripts/summarize_results.py`. |
 | [docs/architecture.md](docs/architecture.md) | How the system works end-to-end: batching, LUAR pooling, SupCon, enrollment & scoring |
 | [docs/results.md](docs/results.md) | Experimental results, current gaps, prioritized next steps |
 | [docs/metrics.md](docs/metrics.md) | Every W&B metric the trainer logs and how to read it |
