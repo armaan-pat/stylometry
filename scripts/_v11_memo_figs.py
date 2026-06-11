@@ -269,6 +269,63 @@ fig.tight_layout(rect=[0, 0, 1, 0.94])
 fig.savefig(OUT / "fig5_score_geometry.png", dpi=130)
 plt.close(fig)
 
+# ---------------------------------------------------------------- Figure 6
+# Confusion matrices at the deploy threshold (catch 99% of LLM text → synthetic
+# FPR = 1%), COMMON corpus (enron_shortmail + syn-v2), scorer baseline_linear_z3.
+# Exact counts: n_genuine=264, n_other=600, n_synthetic=600.
+def common_row(arm, scorer="baseline_linear_z3"):
+    d = json.load(open(ROOT / f"results/v11/ablate_common_{arm}.json"))
+    r = next(x for x in d["rows"] if x["scorer"] == scorer)
+    return d["probe"], r
+
+order = ["lora", "lora_supcon", "frozen", "frozen_supcon", "detector"]
+fig, axes = plt.subplots(1, len(order), figsize=(19, 4.3))
+for ax, arm in zip(axes, order):
+    probe, r = common_row(arm)
+    Ng, No, Ns = probe["n_genuine"], probe["n_other"], probe["n_synthetic"]
+    tpr1 = r["tpr1"]                       # genuine accept rate @ syn-1%-FPR thr
+    fo1 = r["fpr_other_at_1"]              # wrong-human accept rate @ same thr
+    fs1 = 0.01                             # synthetic accept rate (by construction)
+    # rows: true class; cols: ACCEPT (as claimed sender) / REJECT (flag fraud)
+    M = np.array([
+        [tpr1 * Ng, (1 - tpr1) * Ng],      # genuine  -> want ACCEPT
+        [fo1 * No, (1 - fo1) * No],        # other    -> want REJECT
+        [fs1 * Ns, (1 - fs1) * Ns],        # synthetic-> want REJECT
+    ])
+    rates = M / M.sum(axis=1, keepdims=True)
+    # green where the decision is CORRECT (diag of desired), red where wrong
+    correct = np.array([[1, 0], [0, 1], [0, 1]])  # 1 = desired cell
+    disp = np.where(correct == 1, rates, -rates)   # +good / -bad for coloring
+    ax.imshow(disp, cmap="RdYlGn", vmin=-1, vmax=1, aspect="auto")
+    for i in range(3):
+        for j in range(2):
+            ax.text(j, i, f"{int(round(M[i, j]))}\n{rates[i, j]*100:.0f}%",
+                    ha="center", va="center", fontsize=10,
+                    color="black", fontweight="bold")
+    ax.set_xticks([0, 1]); ax.set_xticklabels(["ACCEPT\n(as sender)", "REJECT\n(fraud)"], fontsize=8)
+    ax.set_yticks([0, 1, 2])
+    if arm == order[0]:
+        ax.set_yticklabels(["genuine\n(want accept)", "other\n(want reject)", "synthetic\n(want reject)"], fontsize=8)
+    else:
+        ax.set_yticklabels([])
+    ax.set_title(f"{arm}\nLLM caught {(1-fs1)*100:.0f}% | wrong-human leak {fo1*100:.0f}%", fontsize=9)
+    for sp in ax.spines.values():
+        sp.set_visible(False)
+fig.suptitle(
+    "Fig 6 — Confusion at the deploy threshold (set to catch 99% of LLM text, i.e. synthetic FPR=1%), "
+    "COMMON corpus, K=8.\nAll arms reject ~all LLM text; they differ entirely on the WRONG-HUMAN row — "
+    "lora leaks 9%, the detector leaks 88%.",
+    fontsize=10,
+)
+fig.tight_layout(rect=[0, 0, 1, 0.9])
+fig.savefig(OUT / "fig6_confusion_matrices.png", dpi=130)
+plt.close(fig)
+print("confusion (common, syn-1%-FPR thr):")
+for arm in order:
+    probe, r = common_row(arm)
+    print(f"  {arm:14} genuine_accept={r['tpr1']*100:4.0f}%  wrong_human_leak={r['fpr_other_at_1']*100:4.0f}%"
+          f"  LLM_leak=1%  auc_other={r.get('auc_g_other', float('nan')):.3f}")
+
 # ---------------------------------------------------------------- console dump
 print("figures ->", OUT)
 for a in ARMS:

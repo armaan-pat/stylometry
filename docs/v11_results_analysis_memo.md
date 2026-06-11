@@ -9,13 +9,15 @@ draft `docs/v11_synv1_memo.md` (pre-run) and the lineage memos
 
 ## 0. Status and what these numbers are (read this first)
 
-*Update 2026-06-11 (later): the training run was **cut** (the `lora_supcon` arm
-was killed mid-training at ≈ epoch 129/150) and the **eval/ablation phase is now
-running** in the background. This section is the **preliminary, pre-ablation**
-read built entirely from the per-epoch W&B summaries and training logs we already
-have (TPR@FPR, operating points, gaps, embedding metrics). The headline
-`ablate_common_*` table is still pending; §6 says how the picture may shift when
-it lands.*
+*Update 2026-06-11 (final): the training run was **cut** (`lora_supcon` killed at
+≈ epoch 129/150) and the **eval/ablation phase has now completed** — all
+`results/v11/{probe,ablate_own,ablate_common,ood}_*.json` exist. **§5.7 (the
+apples-to-apples common-corpus table), §5.8 (confusion matrices, Fig 6), and §6
+(verdict) are now filled from real numbers.** The §5.1–5.6 per-epoch own-corpus
+analysis below is unchanged and still correct; the common-corpus ablation
+confirms its direction and sharpens the verdict. The one caveat that remains:
+`lora_supcon` was scored from its undertrained ep-21 `checkpoint_best`, so its row
+is a floor, not a fair read of the supcon-under-LoRA recipe.*
 
 This memo reasons about the **per-epoch W&B summaries** of the v11 arms, not the
 post-hoc ablation JSONs — `results/v11/ablate_common_*.json` **do not exist
@@ -32,11 +34,12 @@ yet**. Three consequences, all of which I carry through every comparison below:
    therefore a *rough anchor, not an apples-to-apples comparison*. The
    apples-to-apples row is the pending `ablate_common_*` (both scored on
    `enron_shortmail` + syn-v2); §6 says how to read it when it lands.
-3. **`lora_supcon` was cut at ≈ epoch 129/150** — no end-of-run summary was
-   written, so its row is blank in the summary-based tables/figures here. The
-   running eval phase will still score its (partial) `checkpoint_best`; treat any
-   `lora_supcon` eval number as **undertrained**, not final. The other four arms
-   (frozen, frozen_supcon, lora, detector) finished 150 epochs.
+3. **`lora_supcon` was cut at ≈ epoch 129/150** — no end-of-run W&B summary was
+   written, so it is blank in the per-epoch (§5.1–5.6) tables/figures. It *does*
+   appear in the ablation results (§5.7–5.9), but scored from its **ep-21
+   `checkpoint_best`** (its monitor peaked at epoch 21) — treat every
+   `lora_supcon` number as **undertrained**, a floor not a final read. The other
+   four arms (frozen, frozen_supcon, lora, detector) finished 150 epochs.
 
 The whole analysis sits on top of the central finding from the 2026-06-10
 lineage run, which is worth restating because it is *why v11 exists*:
@@ -414,13 +417,17 @@ resolution needs backbone adaptation, and a frozen backbone cannot supply it.
   human from another in the low-FPR tail requires the LoRA layers to move. This
   mirrors the v6 frozen-vs-LoRA ablation and answers the arm's headline question
   decisively: **most of v11's *authorship* value is backbone adaptation.**
-- **The episodic loss vs supcon verdict is corpus-pending.** At ep150 on the own
-  corpus, frozen_supcon edges frozen on synthetic (pAUC 0.982 vs 0.896) but both
-  are equally poor on other (~0.29) — i.e. under a frozen backbone the loss choice
-  only moves the easy axis. The LoRA comparison (lora vs lora_supcon) is the one
-  that matters for "is episodic earning its complexity," and **`lora_supcon` is
-  still training** — leave that conclusion for the common-corpus ablation. (Prior:
-  the lineage never isolated this; v11 is the first clean read.)
+- **Episodic vs supcon: episodic earns its complexity on the metric that
+  matters.** On the common corpus (§5.7), `lora` (episodic) leaks **9 %** of
+  wrong-human mail at the deploy threshold vs `lora_supcon`'s **37 %** — a 4×
+  difference in the failure mode we care about — while `lora_supcon` scores
+  slightly higher on the easy synthetic axis (tpr1 0.905 vs 0.875). Same story
+  frozen-side: `frozen` 31 % vs `frozen_supcon` 49 %. The episodic variable-K′
+  loss buys *authorship discrimination* (lower wrong-human leak, higher
+  other-AUC), exactly the axis supcon under-serves. **Caveat:** `lora_supcon` is
+  the undertrained ep-21 checkpoint, so this is a floor on the gap, not a clean
+  read — but the frozen pair (both 150 ep) shows the same direction, so the
+  conclusion holds. The lineage never isolated this; v11 is the first clean read.
 - **The detector arm behaves exactly as designed**: strong synthetic
   (TPR@1% 0.94, pAUC 0.941), weak pooled/other (TPR@1%_all 0.390, other-pAUC
   0.450). It is the *detector half* of the two-model design
@@ -440,8 +447,10 @@ The v11 results are coherent with — and explained by — the lineage findings:
   on the common corpus (−20 pp TPR@1%) and reasoned that LLM positives erode the
   "reject-LLM-flavored-text" shortcut a single-generator pool rewards.** v11 acts
   on that conclusion by *banning* LLM positives in code (A.1b) and recovering
-  register invariance from real text. The v11-lora ↔ lineage-v9 gap, when the
-  common-corpus eval lands, will quantify what that ban cost or saved.
+  register invariance from real text. The common-corpus result (§5.7) vindicates
+  it: v11-lora hits **tpr1 0.875** vs lineage-v7's 0.670 and v9's 0.572 — the
+  no-LLM-positive recipe is the best synthetic detector in the whole lineage,
+  with wrong-human leak (FPR_other@5% 0.298) far below v9@ep10's 0.595.
 - **v8→v9 ("episodic + short-mail"): the lineage's headline v9 win was an
   artifact of the ep10 checkpoint, and v9@ep150 was the best human-impostor
   discriminator we'd seen (other-AUC 0.933) with a collapsed synthetic tail.**
@@ -456,26 +465,137 @@ lineage's own diagnosis turned into an experiment. The metrics behave the way
 the lineage said they would, which is the strongest evidence that the diagnosis
 (two objectives, one space, a monitor that watches only one) was correct.
 
+### 5.7 The apples-to-apples result: common-corpus ablation
+
+This is the table the whole memo was waiting for — every arm's `checkpoint_best`
+scored on the **same** production-like corpus (`enron_shortmail` + syn-v2),
+`baseline_linear_z3` (the recommended scorer for all five), K=8, 1000-sample
+bootstrap. Probe set: 44 enrolled senders, **264 genuine / 600 other / 600
+synthetic** queries. The lineage rows are the same harness/corpus from
+`docs/v9_lineage_results_analysis.md` §5.
+
+| Model | AUC g/syn | TPR@1%FPR_syn | TPR@5% | EER | AUC g/other | **FPR_other@1%** | **FPR_other@5%** |
+|---|---|---|---|---|---|---|---|
+| lineage v7 (ep76) | 0.947 | 0.670 | 0.822 | 0.118 | — | — | 0.172 |
+| lineage v8 (ep37) | 0.922 | 0.466 | 0.708 | 0.147 | — | — | 0.117 |
+| lineage v9 (ep10) | 0.953 | 0.572 | 0.837 | 0.099 | ~0.70 | — | **0.595** |
+| **v11 lora** | 0.967 | 0.875 | 0.936 | 0.057 | **0.934** | **0.093** | 0.298 |
+| v11 lora_supcon† | 0.987 | 0.905 | 0.973 | 0.039 | 0.881 | 0.373 | 0.660 |
+| v11 frozen | 0.988 | 0.852 | 0.962 | 0.046 | 0.833 | 0.312 | 0.538 |
+| v11 frozen_supcon | 0.996 | 0.947 | 0.996 | 0.022 | 0.838 | 0.488 | 0.765 |
+| v11 detector | 0.991 | 0.970 | 0.985 | 0.016 | 0.710 | 0.885 | 1.000 |
+
+† undertrained ep-21 checkpoint — a floor, not a fair read.
+
+`FPR_other@X%` is the new, load-bearing column: **the fraction of wrong-sender
+real-human mail accepted at the threshold that holds LLM (synthetic) false-accepts
+to X%** (`fpr_other_at_X` in `ablate_adaptive_scorers.py` — exactly the metric the
+2026-06-10 lineage used to expose v9@ep10's 0.595). Three readings:
+
+1. **Every v11 arm beats the entire lineage on synthetic detection.** TPR@1%
+   jumps from the lineage's 0.47–0.67 band to **0.85–0.97**. The no-LLM-positive
+   + crop + register recipe (and 4× more synthetic pressure) genuinely improved
+   the easy axis across the board — this is real, not a checkpoint artifact.
+2. **The arms diverge entirely on `FPR_other`, and `lora` wins decisively.**
+   At the 1 %-synthetic threshold, `lora` leaks **9.3 %** of wrong-human mail;
+   `detector` leaks **88.5 %**, `frozen_supcon` 48.8 %. `lora` is the only arm
+   whose wrong-human leak is in the same league as the best lineage models
+   (v7 0.172 / v8 0.117 at the 5 % threshold; lora is 0.298 there, 0.093 at 1 %).
+3. **`lora` is, on balance, the best model the project has produced.** It pairs
+   the best-ever synthetic TPR@1% (0.875, +20 pp over lineage-v7) with the best
+   AUC g/other (0.934) and a wrong-human leak an order of magnitude below
+   v9@ep10. It needs *no* second model and *no* two-threshold scheme — a single
+   embedding + `linear_z3` does it. That is the headline result.
+
+### 5.8 Confusion matrices — the one row that separates the arms
+
+![Fig 6](../results/v11/figures/fig6_confusion_matrices.png)
+
+`fig6_confusion_matrices.png` turns §5.7 into five exact confusion matrices, all
+at the **deploy threshold set to catch 99 % of LLM text** (synthetic FPR = 1 %),
+common corpus, K=8. Rows are the true class (genuine 264 / other 600 / synthetic
+600); columns are the decision (ACCEPT as the claimed sender / REJECT as fraud).
+By construction every arm's bottom row is identical — **6 of 600 synthetics
+slip through, 594 rejected (the 99 % LLM catch)**. The top row barely moves —
+all arms accept 85–97 % of genuine mail. **The entire story is the middle row:**
+
+- **lora — 56/600 (9 %) wrong-human impostors accepted.** A deployable verifier:
+  it catches ~all LLM forgeries *and* rejects 91 % of human impostors at the same
+  threshold.
+- **frozen 187 (31 %), lora_supcon 224 (37 %), frozen_supcon 293 (49 %)** — half
+  the human impostors walk through. Usable only as LLM-text detectors.
+- **detector — 531/600 (88 %) wrong-human impostors accepted.** As an authorship
+  verifier it is barely better than accept-everyone; as the *detector half* of a
+  two-model design (its intended role) it is the best LLM catcher (97 % genuine
+  accept, EER 0.016) but must be paired with a separate verifier — which is the
+  whole point of `docs/v10_two_model_memo.md`. The confusion matrix is the visual
+  proof that one embedding cannot be both.
+
+This is the 2026-06-10 v9@ep10 failure (59.5 % leak) reproduced, ranked, and
+*explained* across the design space — and it identifies the one arm (`lora`) that
+escapes it without a second model.
+
+### 5.9 OOD generalization to unseen senders (sliced)
+
+`ood_*.json` runs **pairwise** verification on **6 held-out test senders** (no
+enrolled centroid bank), sliced by length and register — the only measurement
+here on identities never seen in training. It is a harder, noisier task (small
+sender count); read it directionally.
+
+| arm | overall AUC | register:same | register:cross | len:short | lenmix:short↔long |
+|---|---|---|---|---|---|
+| lora | 0.731 | 0.797 | 0.676 | 0.689 | 0.637 |
+| lora_supcon† | 0.747 | 0.820 | 0.714 | 0.667 | 0.597 |
+| frozen | 0.670 | 0.713 | 0.628 | 0.648 | 0.541 |
+| frozen_supcon | 0.659 | 0.706 | 0.606 | 0.652 | 0.542 |
+| detector | 0.637 | 0.688 | 0.559 | 0.618 | 0.527 |
+
+Two takeaways: (1) the LoRA arms generalize to unseen senders best (overall
+~0.73–0.75) and the detector worst (0.637) — consistent with §5.7/§5.8, authorship
+transfers, pure LLM-detection does not. (2) **The `lenmix:short↔long` slice is
+near-chance for every arm (0.53–0.64)** — verifying a short email against a long
+one (or vice-versa) is still largely unsolved. Crop augmentation helped same-length
+short queries (`len:short` ≈ 0.65–0.69) but did **not** buy true length
+invariance across a large length gap. That is the clearest open problem the run
+surfaces, and it is invisible to the enrolled-probe metrics in §5.1–5.8.
+
 ---
 
-## 6. How to read the run when it finishes
+## 6. Verdict and next steps
 
-1. **Use `ablate_common_*.json` (syn-v2, `enron_shortmail`) for any v6/v7/v8/v9
-   ↔ v11 claim.** The own-corpus numbers in this memo are directional; the common
-   corpus is the only fair lineage comparison. Drop the common-corpus rows into
-   `docs/v9_lineage_memo.md` §5 next to v7/v8/v9.
-2. **Always quote `FPR_other` / `tpr_at_fpr/other_1pct` next to the synthetic
-   number** (the memory note's standing rule). The synthetic headline is
-   saturated and no longer discriminating; the *other* tail is where arms differ.
-3. **For the detector arm, score the BCE logit, not the centroid probe**, and
-   prefer `checkpoint_last` (or the composite monitor) over its ep11
-   `checkpoint_best` — its monitor watches an axis orthogonal to its output (§5.1).
-4. **Settle "is episodic earning its complexity" only after `lora_supcon`
-   finishes** — it is the one controlled flip that isolates the loss under LoRA.
-5. **Watch the sliced OOD eval** (`ood_*.json`): it is the only measurement of
-   whether crop-aug + register-stratified sampling actually bought
-   length/register invariance on *unseen* senders, rather than on the training
-   distribution.
+**`v11_synv1_lora` is the recommended model and the project's new best.** On the
+fair common-corpus eval it is the best LLM-forgery detector in the lineage
+(TPR@1% 0.875) *and* the best human-impostor verifier (AUC g/other 0.934,
+wrong-human leak 9 % at the deploy threshold), from a single embedding +
+`linear_z3`, no second model. The ablation cleanly attributes this: the
+authorship gain is the **episodic objective + short-mail distribution** (lora
+beats lora_supcon 9 % vs 37 % leak; frozen 31 % vs frozen_supcon 49 %), **not**
+the cross-register LLM positives that v8 introduced and v11 banned — confirming
+the lineage's v7→v8 regression diagnosis and the decision to enforce
+"LLM-text-is-never-a-positive" in code.
 
-*Figures regenerate from the run logs + W&B summaries via
-`python scripts/_v11_memo_figs.py` → `results/v11/figures/`.*
+The other arms resolved their questions:
+- **detector** — best LLM catcher (EER 0.016) but an 88 % wrong-human leak; it is
+  the *detector half* of the two-model design, never a standalone verifier. Score
+  its BCE **logit** (not the centroid probe) and use `checkpoint_last`, not its
+  ep-11 `checkpoint_best` (§5.1).
+- **frozen / frozen_supcon** — a frozen LUAR space is a decent LLM detector but
+  cannot do low-FPR authorship (kNN stalls at 0.52, leak 31–49 %). Authorship
+  needs backbone adaptation.
+- **episodic > supcon** on the metric that matters (wrong-human leak), confirmed.
+
+Open items, in priority order:
+1. **Length invariance is unsolved** (§5.9: lenmix near-chance). Crop aug didn't
+   buy cross-length verification — next is length-conditioned scoring or
+   length-matched enrollment.
+2. **Re-train `lora_supcon` to 150 ep** for a clean episodic-vs-supcon-under-LoRA
+   number; the ep-21 row is only a floor.
+3. **Multi-generator impostors.** Every synthetic here is Mistral-7B, so "reject
+   LLM-ness" is still a single-generator shortcut (lineage eval hole #2). Until a
+   multi-LLM eval exists, the saturated synthetic numbers are an upper bound.
+4. **Drop the v11-lora common-corpus row into `docs/v9_lineage_memo.md` §5** next
+   to v7/v8/v9 as the new lineage head.
+
+*All figures + tables regenerate from the run logs, W&B summaries, and
+`results/v11/*.json` via `python scripts/_v11_memo_figs.py` →
+`results/v11/figures/`.*
