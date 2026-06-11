@@ -177,6 +177,98 @@ fig.tight_layout(rect=[0, 0, 1, 0.92])
 fig.savefig(OUT / "fig3_final_comparison.png", dpi=130)
 plt.close(fig)
 
+# ---------------------------------------------------------------- Figure 4
+# Low-FPR operating curves: TPR at FPR budgets {1,5,10}% for the synthetic pool
+# (genuine-vs-synthetic ROC) vs the pooled "all" set (genuine-vs-all ROC). The
+# vertical gap between an arm's two curves is the cost of the wrong-human tail.
+fig, axes = plt.subplots(1, 2, figsize=(13, 5), sharey=True)
+fprs = [1, 5, 10]
+arm_colors = {"frozen": "tab:purple", "frozen_supcon": "tab:brown",
+              "lora": "tab:green", "detector": "tab:red"}
+# synthetic pool
+ax = axes[0]
+for a, c in arm_colors.items():
+    ys = [g(a, f"op/synthetic/fpr_0.0{f}/recall") if f < 10 else g(a, "op/synthetic/fpr_0.10/recall")
+          for f in fprs]
+    ax.plot(fprs, ys, "-o", color=c, label=a)
+ax.plot([1, 5], [0.55, 0.792], "--s", color="tab:orange", label="v6 (own corpus)")
+ax.set_title("genuine vs SYNTHETIC (LLM text)", fontsize=10)
+ax.set_xlabel("FPR budget (%)"); ax.set_ylabel("TPR (recall on genuine)")
+ax.set_ylim(0, 1.02); ax.grid(alpha=0.3); ax.legend(fontsize=8, loc="lower right")
+# pooled
+ax = axes[1]
+for a, c in arm_colors.items():
+    ys = [g(a, f"op/all/fpr_0.0{f}/recall") if f < 10 else g(a, "op/all/fpr_0.10/recall")
+          for f in fprs]
+    ax.plot(fprs, ys, "-o", color=c, label=a)
+ax.plot([1, 5], [0.667, 0.808], "--s", color="tab:orange", label="v6 (own corpus)")
+ax.set_title("genuine vs ALL (pooled — gated by wrong-human tail)", fontsize=10)
+ax.set_xlabel("FPR budget (%)")
+ax.set_ylim(0, 1.02); ax.grid(alpha=0.3); ax.legend(fontsize=8, loc="lower right")
+fig.suptitle(
+    "Fig 4 — Low-FPR operating curves. Every arm hugs the ceiling on synthetics (left); "
+    "on the pooled set (right)\nonly lora stays high — the others collapse because the "
+    "wrong-human tail sets the pooled threshold.",
+    fontsize=10,
+)
+fig.tight_layout(rect=[0, 0, 1, 0.93])
+fig.savefig(OUT / "fig4_operating_curves.png", dpi=130)
+plt.close(fig)
+
+# ---------------------------------------------------------------- Figure 5
+# (a) Score-geometry number line: position of each population relative to the
+#     genuine mean (x = mean_X - mean_genuine = -gap_X). Shows the sign flip
+#     spatially. (b) Embedding clustering quality (knn-acc / pair-auroc).
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+ax = axes[0]
+rows = [
+    ("v6 (ep100)", -0.4839, -0.3992),  # -gap_other, -gap_synthetic (v6 summary)
+    ("frozen", -g("frozen", "score/gap_other"), -g("frozen", "score/gap_synthetic")),
+    ("frozen_supcon", -g("frozen_supcon", "score/gap_other"), -g("frozen_supcon", "score/gap_synthetic")),
+    ("lora", -g("lora", "score/gap_other"), -g("lora", "score/gap_synthetic")),
+    ("detector", -g("detector", "score/gap_other"), -g("detector", "score/gap_synthetic")),
+]
+for i, (name, x_other, x_syn) in enumerate(rows):
+    y = len(rows) - i
+    ax.plot([min(x_other, x_syn, -0.05), 0.02], [y, y], color="0.85", lw=1, zorder=0)
+    ax.scatter(0, y, marker="|", s=400, color="k", zorder=3)
+    ax.scatter(x_other, y, s=90, color="tab:blue", zorder=3)
+    ax.scatter(x_syn, y, s=90, color="tab:red", zorder=3)
+    ax.text(0.04, y, name, va="center", fontsize=9)
+    # arrow showing which is the harder (closer-to-genuine) tail
+    if x_syn > x_other:
+        ax.annotate("", xy=(x_syn, y), xytext=(x_other, y),
+                    arrowprops=dict(arrowstyle="->", color="tab:orange", lw=1.2))
+ax.scatter([], [], color="tab:blue", label="other (wrong human)")
+ax.scatter([], [], color="tab:red", label="synthetic (LLM)")
+ax.scatter([], [], marker="|", color="k", label="genuine mean (reference, 0)")
+ax.axvline(0, color="k", lw=0.8)
+ax.set_yticks([]); ax.set_xlabel("mean centroid score − mean(genuine)   (closer to 0 = harder to reject)")
+ax.set_xlim(-0.62, 0.42)
+ax.set_title("(a) Score geometry: where each impostor pool sits vs genuine\n"
+             "v6 = synthetic is the rightmost (hardest); v11 = other is rightmost (flip)", fontsize=9)
+ax.legend(fontsize=8, loc="lower left")
+
+ax = axes[1]
+arms5 = ["frozen", "frozen_supcon", "lora", "detector"]
+xlab = ["v6"] + arms5
+knn = [1.0] + [g(a, "embedding/knn_accuracy") for a in arms5]
+pair = [1.0] + [g(a, "embedding/pair_auroc") for a in arms5]
+x = np.arange(len(xlab)); w = 0.38
+ax.bar(x - w/2, knn, w, label="kNN accuracy", color="tab:cyan")
+ax.bar(x + w/2, pair, w, label="pair AUROC", color="tab:olive")
+ax.set_xticks(x); ax.set_xticklabels(xlab, rotation=20, ha="right", fontsize=8)
+ax.set_ylim(0, 1.05); ax.set_ylabel("embedding clustering quality")
+ax.set_title("(b) Per-sender clustering of the embedding\n"
+             "frozen LUAR stalls at chance-ish kNN; LoRA/detector move the backbone\n"
+             "(v6=1.0 is train-sender memorization — different probe set)", fontsize=9)
+ax.legend(fontsize=8); ax.grid(alpha=0.3, axis="y")
+fig.suptitle("Fig 5 — Why the pooled metric splits the arms: score geometry (a) and "
+             "embedding clustering (b)", fontsize=10)
+fig.tight_layout(rect=[0, 0, 1, 0.94])
+fig.savefig(OUT / "fig5_score_geometry.png", dpi=130)
+plt.close(fig)
+
 # ---------------------------------------------------------------- console dump
 print("figures ->", OUT)
 for a in ARMS:

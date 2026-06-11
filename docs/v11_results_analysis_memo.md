@@ -9,10 +9,17 @@ draft `docs/v11_synv1_memo.md` (pre-run) and the lineage memos
 
 ## 0. Status and what these numbers are (read this first)
 
+*Update 2026-06-11 (later): the training run was **cut** (the `lora_supcon` arm
+was killed mid-training at ≈ epoch 129/150) and the **eval/ablation phase is now
+running** in the background. This section is the **preliminary, pre-ablation**
+read built entirely from the per-epoch W&B summaries and training logs we already
+have (TPR@FPR, operating points, gaps, embedding metrics). The headline
+`ablate_common_*` table is still pending; §6 says how the picture may shift when
+it lands.*
+
 This memo reasons about the **per-epoch W&B summaries** of the v11 arms, not the
 post-hoc ablation JSONs — `results/v11/ablate_common_*.json` **do not exist
-yet** because the run is still in its training phase. Three consequences, all of
-which I carry through every comparison below:
+yet**. Three consequences, all of which I carry through every comparison below:
 
 1. **The v11 numbers are epoch-150 (last-epoch) centroid-probe metrics on each
    arm's *own* corpus** (`enron_shortmail` + `enron_synthetic_v1`). They are not
@@ -25,9 +32,11 @@ which I carry through every comparison below:
    therefore a *rough anchor, not an apples-to-apples comparison*. The
    apples-to-apples row is the pending `ablate_common_*` (both scored on
    `enron_shortmail` + syn-v2); §6 says how to read it when it lands.
-3. **`lora_supcon` is still training** (≈ epoch 94/150 at the time of writing) —
-   its row is blank everywhere. The other four arms (frozen, frozen_supcon,
-   lora, detector) finished 150 epochs.
+3. **`lora_supcon` was cut at ≈ epoch 129/150** — no end-of-run summary was
+   written, so its row is blank in the summary-based tables/figures here. The
+   running eval phase will still score its (partial) `checkpoint_best`; treat any
+   `lora_supcon` eval number as **undertrained**, not final. The other four arms
+   (frozen, frozen_supcon, lora, detector) finished 150 epochs.
 
 The whole analysis sits on top of the central finding from the 2026-06-10
 lineage run, which is worth restating because it is *why v11 exists*:
@@ -294,6 +303,29 @@ Read the two together, not either alone.
 
 ### 5.3 TPR@FPR — why the pooled rate is gated by the wrong-human tail
 
+![Fig 4](../results/v11/figures/fig4_operating_curves.png)
+
+The operating points we have (recall = TPR on genuine, at fixed impostor FPR
+budgets — `op/<pool>/fpr_X/recall`, with precision alongside):
+
+| arm | syn TPR@1% | syn@5% | syn@10% | **all** TPR@1% | all@5% | all@10% | all prec@1% |
+|---|---|---|---|---|---|---|---|
+| v6\* | 0.55 | 0.79 | — | 0.667 | 0.808 | — | — |
+| frozen | 0.833 | 0.973 | 0.981 | 0.299 | 0.542 | 0.674 | 0.878 |
+| frozen_supcon | 0.973 | 1.000 | 1.000 | 0.280 | 0.527 | 0.659 | 0.871 |
+| **lora** | 0.917 | 0.932 | 0.932 | **0.742** | **0.848** | **0.917** | **0.947** |
+| detector | 0.939 | 0.939 | 0.939 | 0.390 | 0.712 | 0.818 | 0.904 |
+
+\* v6 = own corpus; only the 1 %/5 % anchors were logged. `fig4_operating_curves.png`
+plots these as low-FPR ROC segments — synthetic pool (left) vs pooled (right).
+
+A caveat on the *other* tail specifically: these four runs were trained **before**
+the working-tree change that adds `tpr_at_fpr/other_*` and `op/other/*`, so their
+summaries don't carry an other-only operating point. But the pooled ("all") column
+*is* the other tail in disguise: synthetics are near-ceiling (left panel of Fig 4),
+so any shortfall in the pooled column is the wrong-human pool. The re-scored
+numbers from the running eval phase will have the explicit `op/other/*` keys.
+
 The TPR@FPR differences fall straight out of §5.1–5.2:
 
 - **TPR@1%FPR_synthetic rises across the board** (v6 0.55 → frozen_supcon 0.973,
@@ -310,12 +342,19 @@ The TPR@FPR differences fall straight out of §5.1–5.2:
   pushed the *other*-AUC up to 0.934 while keeping synthetic high.
 
 This is the v9@ep10 failure (accepts 59.5 % of wrong-sender mail) showing up in
-the v11 metrics — but now *visibly*, because the harness reports
-`tpr_at_fpr/other_*` and `op/other/*` instead of hiding it inside a
-synthetic-only headline. The two frozen arms and the detector arm are, by this
-metric, **LLM-text detectors that are weak authorship verifiers** — which for the
-detector arm is the explicit design, and for the frozen arms is the answer to
-"can a fixed LUAR space do authorship?" (no, see §5.5).
+the v11 metrics — but now *legible*, because the harness was rebuilt to report
+the wrong-human tail (`tpr_at_fpr/other_*`, `op/other/*`) instead of hiding it
+inside a synthetic-only headline. The two frozen arms and the detector arm are,
+by this metric, **LLM-text detectors that are weak authorship verifiers** — which
+for the detector arm is the explicit design, and for the frozen arms is the answer
+to "can a fixed LUAR space do authorship?" (no, see §5.5).
+
+One more thing the operating points expose that the AUC hides — **precision at
+the deploy budget**. At 1 % FPR, lora flags fraud at 0.947 precision vs detector
+0.904, frozen 0.878, frozen_supcon 0.871. Because synthetics are easy, the
+precision loss is again wrong-human false-accepts contaminating the flagged set:
+the same single failure mode reads out in recall *and* precision *and* the gap
+geometry (§5.4a). They are three views of one fact.
 
 ### 5.4 pAUC — the same split, integrated over the low-FPR region
 
@@ -337,6 +376,34 @@ detector arm is the explicit design, and for the frozen arms is the answer to
 Compare to v6's `test/pAUC@5% = 0.393`: even v6's own pooled pAUC was mediocre.
 The point of v11's pAUC reporting is not that the number went up — it is that the
 number is now *attributable* to a specific negative type.
+
+### 5.4a Score geometry and embedding clustering — the mechanism behind the split
+
+![Fig 5](../results/v11/figures/fig5_score_geometry.png)
+
+`fig5_score_geometry.png` makes the *why* concrete with two views built from the
+gap and embedding numbers we already have.
+
+**(a) Score geometry.** Plotting each impostor pool's mean score *relative to the
+genuine mean* (x = `mean_X − mean_genuine` = `−gap_X`) puts all three populations
+on one number line per arm. The closer to 0, the harder to reject. v6 is the only
+row where the **synthetic** marker sits to the *right* of (closer to genuine than)
+the **other** marker — synthetics are its hardest tail. Every v11 arm flips: the
+synthetic marker is pushed far left (≈ −0.50 to −0.57) while the wrong-human marker
+creeps toward 0. This is the spatial form of the §5.2 sign flip, and it shows the
+*magnitude*: frozen_supcon pushes synthetics furthest (−0.54) yet leaves other at
+−0.26; lora is the most balanced (other −0.49, synthetic −0.57), which is exactly
+why its pooled tail survives.
+
+**(b) Embedding clustering.** `embedding/knn_accuracy` and `pair_auroc` measure
+whether the embedding groups emails by author at all. The frozen arms are stuck at
+kNN ≈ 0.52 — a frozen LUAR space, however well its projection is reshaped, cannot
+cluster *these* senders better than that; the loss only moves the easy synthetic
+axis on top of it. LoRA and the detector reach ≈ 0.77 because the backbone
+actually moves. (v6's 1.0 is not comparable — its probe ran on *training* senders,
+so it reflects memorization, not generalization; v11 probes held-out queries.)
+This is the embedding-level cause of the pAUC-other split in §5.4: authorship
+resolution needs backbone adaptation, and a frozen backbone cannot supply it.
 
 ### 5.5 frozen ↔ lora, and episodic ↔ supcon
 
