@@ -75,11 +75,19 @@ data:
     min_body_chars: 20
     min_body_words: 5
   augmentation:
+    # NOTE: enron_synthetic_v2 was generated with LLM positives (cross_register /
+    # cross_length rows under real sender_ids). SyntheticAugmentedDataset now
+    # DROPS those at load time (llm_negatives_only default) and logs a warning —
+    # only the hard_neg __syn rows are kept. To silence the warning, regenerate
+    # with `--llm-positives exclude` (now the default). The register-invariance
+    # those LLM positives used to provide is recovered LLM-free via
+    # register_stratified below + crop augmentation.
     synthetic_path: data/synthetic/enron_synthetic_v2
     n_syn_per_batch: 4
-    crop_prob: 0.3
+    crop_prob: 0.3          # length invariance: short real positives via crops
     crop_min_words: 5
     crop_max_words: 60
+    register_stratified: true  # register invariance: real cross-register positives
 
 training:
   epochs: 150

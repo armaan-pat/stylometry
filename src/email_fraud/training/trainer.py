@@ -25,6 +25,51 @@ from email_fraud.losses.base import BaseLoss
 
 logger = logging.getLogger(__name__)
 
+# Keys that are forwarded to W&B. Everything else (raw score means, loose
+# threshold bands, per-score-fn duplicates, sampler internals, probe counts)
+# is computed locally but not logged — it's noisy and not SLA-relevant.
+_WANDB_KEEP: frozenset[str] = frozenset({
+    # Training health
+    "epoch", "train/loss", "train/lr", "val/loss",
+    # Monitor tracking
+    "monitor/value", "monitor/best",
+    # Embedding-space discrimination
+    "embedding/pair_auroc", "embedding/knn_accuracy",
+    # Centroid headline AUROCs
+    "auc/genuine_vs_other", "auc/genuine_vs_synthetic", "auc/genuine_vs_all",
+    # pAUC in the low-FPR region (SLA = operate below 5% FPR)
+    "pauc/genuine_vs_synthetic_5pct", "pauc/genuine_vs_other_5pct",
+    "pauc/min_other_synthetic_5pct",  # composite anti-Goodhart monitor
+    # TPR at tight FPR anchors
+    "tpr_at_fpr/synthetic_1pct", "tpr_at_fpr/all_1pct",
+    # FPR-anchored operating point at 1% (tightest SLA target)
+    "op/all/fpr_0.01/recall", "op/all/fpr_0.01/precision", "op/all/fpr_0.01/threshold",
+    "op/synthetic/fpr_0.01/recall", "op/synthetic/fpr_0.01/precision",
+    "op/synthetic/fpr_0.01/threshold",
+    # Score geometry (gaps only; raw means are less informative)
+    "score/gap_other", "score/gap_synthetic", "score/synthetic_harder_than_other",
+    # High-confidence threshold band (0.95 is the deployment operating region)
+    "threshold_0.95/recall", "threshold_0.95/fpr_synthetic", "threshold_0.95/precision",
+    # Selective-classifier coverage at tight accuracy
+    "coverage/at_acc_0.95",
+    # Inline PAN test-set verification
+    "test/auc", "test/eer",
+    # FPR comparison reference — 5% and 10% operating points
+    # (kept alongside the 1% SLA anchor for trend comparison, not operational targets)
+    "pauc/genuine_vs_synthetic_10pct",
+    "pauc/genuine_vs_all_5pct", "pauc/genuine_vs_all_10pct",
+    "tpr_at_fpr/synthetic_5pct", "tpr_at_fpr/all_5pct",
+    "op/all/fpr_0.05/recall", "op/all/fpr_0.05/precision", "op/all/fpr_0.05/threshold",
+    "op/all/fpr_0.10/recall", "op/all/fpr_0.10/precision", "op/all/fpr_0.10/threshold",
+    "op/synthetic/fpr_0.05/recall", "op/synthetic/fpr_0.05/precision", "op/synthetic/fpr_0.05/threshold",
+    "op/synthetic/fpr_0.10/recall", "op/synthetic/fpr_0.10/precision", "op/synthetic/fpr_0.10/threshold",
+})
+
+
+def _filter_wandb_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return only the SLA-relevant subset of a W&B log payload."""
+    return {k: v for k, v in payload.items() if k in _WANDB_KEEP}
+
 
 def _fmt(metrics: dict[str, float], key: str, fmt: str = "{:.3f}", missing: str = "  —  ") -> str:
     v = metrics.get(key)
@@ -253,7 +298,7 @@ class Trainer:
                     float(monitor_val) if monitor_val is not None else float("nan")
                 )
                 log_payload["monitor/best"] = self._best_monitor
-                wandb.log(log_payload)
+                wandb.log(_filter_wandb_payload(log_payload))
                 logger.info(
                     "%s",
                     _format_epoch_summary(

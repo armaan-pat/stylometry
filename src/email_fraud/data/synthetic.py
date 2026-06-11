@@ -53,16 +53,51 @@ class SyntheticAugmentedDataset(BaseDataset):
         real_dataset: Any BaseDataset (typically EnronDataset for the train split).
         synthetic_path: Path to the Arrow dataset produced by
                         scripts/generate_synthetic_emails.py.
+        llm_negatives_only: When True (default), DROP every synthetic row whose
+                        sender_id does not end with ``__syn`` — i.e. any LLM text
+                        stored under a real sender_id (cross_register / cross_length
+                        "positives").  This enforces the project invariant that
+                        LLM-generated text is ONLY ever a hard negative, never a
+                        positive, regardless of how the on-disk dataset was
+                        generated.  An LLM impersonation that lands in a real
+                        author's positive cluster teaches the encoder that a
+                        convincing forgery *is* the author — directly opposing the
+                        fraud signal.  Set False only for a deliberate ablation.
     """
 
-    def __init__(self, real_dataset: BaseDataset, synthetic_path: str) -> None:
+    def __init__(
+        self,
+        real_dataset: BaseDataset,
+        synthetic_path: str,
+        llm_negatives_only: bool = True,
+    ) -> None:
         from datasets import load_from_disk
 
         syn_ds = load_from_disk(synthetic_path)
+        syn_texts = list(syn_ds["text"])
+        syn_sids = list(syn_ds["sender_id"])
 
-        self._texts: list[str] = list(real_dataset._texts) + list(syn_ds["text"])
+        if llm_negatives_only:
+            kept = [
+                (t, s) for t, s in zip(syn_texts, syn_sids) if s.endswith(SYN_SUFFIX)
+            ]
+            n_dropped = len(syn_sids) - len(kept)
+            if n_dropped:
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "SyntheticAugmentedDataset: dropped %d/%d synthetic rows stored "
+                    "under a real sender_id (LLM positives) to enforce "
+                    "llm_negatives_only; kept %d hard-negative (__syn) rows. "
+                    "Regenerate with --llm-positives exclude to silence this.",
+                    n_dropped, len(syn_sids), len(kept),
+                )
+            syn_texts = [t for t, _ in kept]
+            syn_sids = [s for _, s in kept]
+
+        self._texts: list[str] = list(real_dataset._texts) + syn_texts
         self._sender_ids_list: list[str] = (
-            list(real_dataset._sender_ids_list) + list(syn_ds["sender_id"])
+            list(real_dataset._sender_ids_list) + syn_sids
         )
 
     def __len__(self) -> int:

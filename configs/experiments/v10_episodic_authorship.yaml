@@ -61,11 +61,14 @@ data:
     min_body_chars: 20
     min_body_words: 5
   augmentation:
+    # enron_synthetic_v2 LLM positives are dropped at load time (negatives only);
+    # register invariance comes from register_stratified + crops, not forgeries.
     synthetic_path: data/synthetic/enron_synthetic_v2
     n_syn_per_batch: 4
-    crop_prob: 0.3
+    crop_prob: 0.3          # length invariance: short real positives via crops
     crop_min_words: 5
     crop_max_words: 60
+    register_stratified: true  # register invariance: real cross-register positives
 
 training:
   epochs: 150

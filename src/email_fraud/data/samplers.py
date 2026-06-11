@@ -24,6 +24,49 @@ def _weighted_sample_no_replace(
     return [item for _, item in scored[:k]]
 
 
+def _register_stratified_pick(
+    pool: list[int],
+    k: int,
+    register_of: list[str],
+    rng: random.Random,
+) -> list[int]:
+    """Pick k indices from *pool*, maximising distinct-register coverage.
+
+    This is the LLM-free replacement for the old ``cross_register`` LLM
+    positives.  Instead of asking an LLM to fake a register shift and storing the
+    forgery under the real sender_id, we deliberately co-sample a sender's *real*
+    formal, casual and terse emails into the same episode.  The K-1 in-episode
+    positives for an anchor then span registers, so SupCon/episodic loss is
+    forced to pull genuine cross-register same-author pairs together — the exact
+    invariance the LLM positives were standing in for, learned from real text.
+
+    We round-robin across the registers present in *pool* (shuffled within each),
+    so the first picks cover one email per register before any register is
+    sampled twice.  Falls back to plain shuffle behaviour when the sender writes
+    in only one register.
+    """
+    by_reg: dict[str, list[int]] = defaultdict(list)
+    for idx in pool:
+        by_reg[register_of[idx]].append(idx)
+    for lst in by_reg.values():
+        rng.shuffle(lst)
+
+    regs = list(by_reg.keys())
+    rng.shuffle(regs)
+    chosen: list[int] = []
+    while len(chosen) < k:
+        progressed = False
+        for r in regs:
+            if by_reg[r]:
+                chosen.append(by_reg[r].pop())
+                progressed = True
+                if len(chosen) == k:
+                    break
+        if not progressed:  # pool exhausted (fewer than k emails available)
+            break
+    return chosen
+
+
 class PKSampler(Sampler[list[int]]):
     """Sample P senders × K emails per batch, without intra-batch replacement."""
 
@@ -34,6 +77,7 @@ class PKSampler(Sampler[list[int]]):
         k: int,
         drop_last: bool = True,
         seed: int | None = None,
+        register_labels: list[str] | None = None,
     ) -> None:
         super().__init__()
         self.p = p
@@ -43,6 +87,15 @@ class PKSampler(Sampler[list[int]]):
         # independent of PyTorch's global RNG and doesn't interfere with model
         # weight initialization or data augmentation.
         self._rng = random.Random(seed)
+        # Optional per-index register label ("formal"/"casual"/"terse"), aligned
+        # to sender_ids. When present, each sender's K emails are picked to cover
+        # as many registers as possible (register-stratified episodes).
+        self._register_of = register_labels
+        if register_labels is not None and len(register_labels) != len(sender_ids):
+            raise ValueError(
+                f"register_labels length ({len(register_labels)}) must match "
+                f"sender_ids length ({len(sender_ids)})."
+            )
 
         self._sender_to_indices: dict[str, list[int]] = defaultdict(list)
         for idx, sid in enumerate(sender_ids):
@@ -76,8 +129,13 @@ class PKSampler(Sampler[list[int]]):
         indices: list[int] = []
         for sid in batch_senders:
             pool = list(self._sender_to_indices[sid])
-            self._rng.shuffle(pool)
-            indices.extend(pool[: self.k])
+            if self._register_of is not None:
+                indices.extend(
+                    _register_stratified_pick(pool, self.k, self._register_of, self._rng)
+                )
+            else:
+                self._rng.shuffle(pool)
+                indices.extend(pool[: self.k])
         return indices
 
     def __iter__(self):
@@ -153,6 +211,7 @@ class SyntheticBalancedSampler(Sampler[list[int]]):
         n_syn: int = 2,
         drop_last: bool = True,
         seed: int | None = None,
+        register_labels: list[str] | None = None,
     ) -> None:
         super().__init__()
         if 2 * n_syn > p:
@@ -165,6 +224,15 @@ class SyntheticBalancedSampler(Sampler[list[int]]):
         self.n_syn = n_syn
         self.drop_last = drop_last
         self._rng = random.Random(seed)
+        # Per-index register label, aligned to sender_ids; drives register-
+        # stratified K-selection (real cross-register positives). See
+        # _register_stratified_pick.
+        self._register_of = register_labels
+        if register_labels is not None and len(register_labels) != len(sender_ids):
+            raise ValueError(
+                f"register_labels length ({len(register_labels)}) must match "
+                f"sender_ids length ({len(sender_ids)})."
+            )
 
         sender_to_indices: dict[str, list[int]] = defaultdict(list)
         for idx, sid in enumerate(sender_ids):
@@ -283,8 +351,13 @@ class SyntheticBalancedSampler(Sampler[list[int]]):
             indices: list[int] = []
             for sid in batch_senders:
                 pool = list(self._sender_to_indices[sid])
-                self._rng.shuffle(pool)
-                indices.extend(pool[: self.k])
+                if self._register_of is not None:
+                    indices.extend(
+                        _register_stratified_pick(pool, self.k, self._register_of, self._rng)
+                    )
+                else:
+                    self._rng.shuffle(pool)
+                    indices.extend(pool[: self.k])
 
             yield indices
 

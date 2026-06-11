@@ -7,6 +7,122 @@ documented here.  Format loosely follows [Keep a Changelog](https://keepachangel
 
 ## [Unreleased]
 
+### Changed (2026-06-11) — LLM synthetics are hard negatives ONLY; LLM-free register/length invariance; multi-LLM generation; sliced OOD eval
+
+Three connected changes: (1) enforce that LLM-generated text is never a positive,
+(2) recover register/length invariance from real data instead of LLM positives,
+(3) generate hard negatives from multiple LLMs, and (4) add an OOD evaluation
+harness that reports metrics per failure axis.
+
+**Enforce: LLM text is a hard negative, never a positive** — the project
+invariant, enforced at two layers so it holds regardless of what is already on
+disk:
+
+- `scripts/generate_synthetic_emails.py`: `--llm-positives` now defaults to
+  `exclude` (was `include`). New datasets emit only `hard_neg` rows
+  (`sid__syn`); the `cross_register` / `cross_length` LLM-positive paths are
+  deprecated and only reachable via the explicit ablation.
+- `data/synthetic.py`: `SyntheticAugmentedDataset(llm_negatives_only=True)`
+  (default) **drops any synthetic row stored under a real `sender_id` at load
+  time**, with a loud warning. `enron_synthetic_v2` (used by v9/v10) contains old
+  LLM positives — they are now dropped automatically, so no regeneration is
+  required to be safe. Storing an LLM impersonation under a real sender_id
+  teaches the encoder a convincing forgery belongs in the author's cluster,
+  opposing the fraud signal — overrides the V8 A/B result that endorsed it.
+
+**B — LLM-free register/length positives** (replace the deprecated LLM positives
+with real-data signal):
+
+- New `data/register.py` — shared `detect_register` (formal/casual/terse) +
+  `partition_by_register`, the single source of truth for both the generator and
+  the sampler. `generate_synthetic_emails.py` now imports it instead of its own
+  copy.
+- **Register-stratified episode sampling** (`data/samplers.py`,
+  `_register_stratified_pick`): when `data.augmentation.register_stratified` is
+  set, each sender's K in-batch emails are picked to cover as many registers as
+  the sender wrote in, so every episode contains genuine cross-register
+  same-author positives. Both `PKSampler` and `SyntheticBalancedSampler` take an
+  optional `register_labels` list; `train.py` computes labels via
+  `_maybe_register_labels` and passes them through.
+- **Length invariance** comes from the existing crop augmentation (now on,
+  `crop_prob: 0.3`). `register_stratified: true` + `crop_prob: 0.3` enabled in
+  `v9_episodic_shortmail.yaml` and `v10_episodic_authorship.yaml`.
+
+**A — Multi-LLM hard-negative generation** (`scripts/llm_backends.py`, new):
+
+- Pluggable `Generator` backends: `hf` (local transformers, moved here so
+  torch/transformers load lazily — API-only runs need no GPU stack), `groq`,
+  `openrouter`, `together`, `deepseek`, `openai` (one OpenAI-compatible client),
+  `gemini`, `ollama`. API backends read `<BACKEND>_API_KEY`, run concurrently
+  (`--request-workers`), and retry on 429/5xx with backoff.
+- `generate_synthetic_emails.py` gains `--generators backend:model ...` and
+  round-robins jobs across a MIX of generators in one run; each row is tagged in
+  the existing `generator` column (now `<backend>:<model>`). This keeps the
+  detector from overfitting to one model's fingerprint and enables
+  held-out-generator OOD eval. `--model` stays as a single-HF back-compat
+  shorthand. Generator composition is printed and logged to W&B.
+
+**OOD evaluation harness** (new):
+
+- `scoring/pairwise.py` — reusable `load_encoder` + `score_pairs` (dedups texts,
+  cosine→[0,1]); replaces the duplicated `_score_pairs` going forward.
+- `scripts/build_ood_eval.py` — builds one tagged `{pair, same, slice}` JSONL
+  from on-disk assets. Slices: `len:short|medium|long`, `lenmix:short_long`,
+  `register:cross|same`, and `gen:<backend>:<model>` (impersonation, one per
+  generator). Length buckets: short ≤20 words, long ≥80.
+- `scripts/eval_ood.py` — scores all pairs once, reports
+  `compute_verification_metrics` per slice + overall, ranks weakest by pAUC@5%,
+  skips single-class slices. Domain OOD folds in via
+  `--extra-pairs domain:<name>=pairs.jsonl`.
+
+**OOD eval — unseen senders + domain corpora** (follow-ups closing the two gaps
+the harness left open):
+
+- `generate_synthetic_emails.py` gains `--from-split {train,validation,test}`
+  (default train). `--from-split test` builds impostors for UNSEEN test senders;
+  the run prints an eval-only warning and the output carries a `source_split`
+  column. `build_ood_eval.py` now looks up the real side of impersonation pairs
+  across ALL splits (splits are sender-disjoint), so `gen:*` slices work for
+  either train-sender (SEEN) or test-sender (UNSEEN) synthetics; provenance is
+  read from `source_split` and printed. This resolves the earlier
+  "`gen:*` slices only cover seen senders" caveat.
+- `scripts/prepare_external_pairs.py` (new) — converts an external corpus into
+  the unified `{pair, same, slice}` JSONL eval_ood ingests. `--format pan`
+  joins PAN pairs+truth files on `id`; `--format authors` samples balanced
+  same/different pairs from a generic `{text, author}` JSONL (Blog Authorship,
+  Reddit, Amazon, …). Optional `--preprocess` runs the project cleaner;
+  `--max-chars` truncates. This is the end-to-end path for domain-OOD slices
+  (real text from another domain — the one OOD axis Enron data can't synthesise).
+
+Tests: `tests/test_external_pairs.py` (4) + 2 added to `tests/test_ood_eval.py`.
+
+**OOD metrics on W&B** (`scripts/eval_ood.py --wandb`):
+
+- Logs every per-slice metric as a summary scalar (`ood/slice/<slice>/<metric>`),
+  plus **per-axis aggregate means** (`ood/axis/<len|gen|register|domain|...>/<metric>_mean`)
+  — one robust number per OOD axis so a new impersonator model or domain shows up
+  as a single movement instead of being buried across many per-slice keys.
+  Promotes overall headline scalars (`ood/overall/AUC` etc.) and the weakest
+  slice (`ood/weakest_slice`, `ood/weakest_pAUC@5%`), and logs an `ood/by_slice`
+  table (slice, axis, n, AUC, pAUC@5%, TPR@FPR=1%, EER, c@1).
+- `--wandb-run-id` attaches the OOD metrics to an EXISTING run (e.g. the training
+  run for the checkpoint) so they land in that run's summary next to the
+  in-distribution numbers; otherwise a new `ood-eval`-tagged run is opened. Note:
+  eval_ood logs to its own/attached run and is NOT subject to the trainer's
+  `_WANDB_KEEP` allowlist, so full per-slice detail is reported.
+- Generation runs now log provenance: `from_split` / `eval_only` in stats +
+  config and `split-<split>` / `eval-only` tags, so test-sender (eval-only)
+  impostor datasets are filterable from training augmentation sets.
+
+Tests: `tests/test_register_sampling.py` (11), `tests/test_ood_eval.py` (9),
+`tests/test_external_pairs.py` (4) — full suite 63 passing. Memory:
+`never-llm-positives`,
+`register-stratified-sampling`, `ood-eval-harness`, `editable-install-divergence`
+(the editable install resolves to a different checkout than this clone — use
+`PYTHONPATH=$PWD/src` to test clone code).
+
+---
+
 ### Added (2026-06-09) — episodic variable-K training + short-email fixes (V9 recipe)
 
 Implements items 1+2 of the attack order in `docs/robustness_mechanisms.md`

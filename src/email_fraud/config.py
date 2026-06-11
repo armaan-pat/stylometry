@@ -107,6 +107,14 @@ class AugmentationConfig(BaseModel):
     crop_min_words: int = 5
     crop_max_words: int = 60
 
+    # Register-stratified episode sampling: when True, each sender's K in-batch
+    # emails are picked to cover as many registers (formal/casual/terse) as the
+    # sender wrote in, so every episode contains genuine cross-register
+    # same-author positives. This is the LLM-free replacement for the deprecated
+    # cross_register LLM positives — it teaches register invariance from real
+    # text instead of from forgeries stored under a real sender_id.
+    register_stratified: bool = False
+
 
 class DataConfig(BaseModel):
     """Dataset paths and sampling parameters."""

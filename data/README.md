@@ -112,3 +112,47 @@ data/raw/llm_impersonation/
   to ensure the model cannot cheat by memorising names.
 - Recommend 20% of each training batch be LLM-impersonation negatives once the
   base model has converged on Enron.
+
+---
+
+## 5. Out-of-Distribution (OOD) Evaluation
+
+The headline test AUC hides where the model actually fails. Build a **sliced**
+OOD pair-set and report metrics per failure axis (short emails, register shifts,
+unseen impersonator LLMs, new domains).
+
+**In-distribution + impersonation slices** (length / register / generator), from
+the processed Enron splits + the generator-tagged synthetic set:
+```bash
+python scripts/build_ood_eval.py --config configs/experiments/v9_episodic_shortmail.yaml \
+    --output data/ood/enron_ood_pairs.jsonl
+python scripts/eval_ood.py --run runs/<run_dir> --pairs data/ood/enron_ood_pairs.jsonl
+```
+
+**Unseen-sender impersonation:** generate impostors from the *test* split, then
+build slices against them (eval only — never train on these):
+```bash
+python scripts/generate_synthetic_emails.py --config <cfg> --from-split test \
+    --generators groq:llama-3.3-70b-versatile gemini:gemini-1.5-flash \
+    --output data/synthetic/enron_test_impostors
+python scripts/build_ood_eval.py --config <cfg> \
+    --synthetic-path data/synthetic/enron_test_impostors --output data/ood/unseen_pairs.jsonl
+```
+
+**Domain OOD** (real text from another domain — the one axis Enron can't
+synthesise). Download PAN (§2) or any `{text, author}` corpus, convert, fold in:
+```bash
+# PAN authorship-verification pairs+truth → one domain slice
+python scripts/prepare_external_pairs.py --format pan \
+    --pairs-file data/raw/pan/pan21/pairs.jsonl \
+    --truth-file data/raw/pan/pan21/truth.jsonl \
+    --slice domain:pan21 --output data/ood/pan21_pairs.jsonl
+# Generic {text, author} corpus (Blog Authorship, Reddit, Amazon, …)
+python scripts/prepare_external_pairs.py --format authors \
+    --input data/raw/blog/blogs.jsonl --author-field id \
+    --slice domain:blog --output data/ood/blog_pairs.jsonl
+
+python scripts/eval_ood.py --run runs/<run_dir> --pairs data/ood/enron_ood_pairs.jsonl \
+    --extra-pairs domain:pan21=data/ood/pan21_pairs.jsonl \
+    --extra-pairs domain:blog=data/ood/blog_pairs.jsonl
+```

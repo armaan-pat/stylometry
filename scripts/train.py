@@ -79,6 +79,30 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _maybe_register_labels(cfg, train_dataset) -> list[str] | None:
+    """Per-index register labels for register-stratified sampling, or None.
+
+    Returns None unless cfg.data.augmentation.register_stratified is set. Labels
+    are computed from the *uncropped* texts (._texts is exposed by every dataset
+    wrapper, including SyntheticAugmentedDataset) so they align with sender_ids,
+    which is what the sampler indexes into. Synthetic ``__syn`` rows are labelled
+    too; that is harmless — stratification only ever affects which of a sender's
+    own emails fill its K slots.
+    """
+    if not cfg.data.augmentation.register_stratified:
+        return None
+    from email_fraud.data.register import detect_register
+
+    texts = train_dataset._texts
+    labels = [detect_register(t) for t in texts]
+    counts = Counter(labels)
+    logger.info(
+        "Register-stratified sampling ON: %d emails — formal=%d casual=%d terse=%d",
+        len(labels), counts.get("formal", 0), counts.get("casual", 0), counts.get("terse", 0),
+    )
+    return labels
+
+
 def _resolve_output_dir(args: argparse.Namespace, config_path: Path) -> Path:
     """Return the fully-resolved output directory for this run."""
     if args.output_dir is not None:
@@ -198,22 +222,29 @@ def _run_training(cfg, EncoderClass, LossClass, HeadClass, args, output_dir: Pat
             cfg.data.augmentation.synthetic_path,
             n_syn,
         )
+        # llm_negatives_only=True (the default) drops any synthetic row stored
+        # under a real sender_id — LLM text is only ever a hard negative, never a
+        # positive — regardless of how the on-disk dataset was generated.
         train_dataset = SyntheticAugmentedDataset(
             train_dataset, cfg.data.augmentation.synthetic_path
         )
+        register_labels = _maybe_register_labels(cfg, train_dataset)
         train_sampler = SyntheticBalancedSampler(
             sender_ids=train_dataset.sender_ids,
             p=p,
             k=cfg.data.emails_per_sender_k,
             n_syn=n_syn,
             seed=0,
+            register_labels=register_labels,
         )
     else:
+        register_labels = _maybe_register_labels(cfg, train_dataset)
         train_sampler = PKSampler(
             sender_ids=train_dataset.sender_ids,
             p=p,
             k=cfg.data.emails_per_sender_k,
             seed=0,
+            register_labels=register_labels,
         )
 
     # Crop augmentation wraps LAST so synthetic emails are cropped too, while
