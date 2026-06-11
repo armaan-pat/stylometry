@@ -39,13 +39,19 @@ class EncoderConfig(BaseModel):
 
 
 class LossConfig(BaseModel):
-    """Contrastive loss config. name: "supcon", "triplet", or "contrastive"."""
+    """Contrastive loss config. name: "supcon", "triplet", "contrastive", or "episodic"."""
     model_config = ConfigDict(extra="forbid")
 
     name: str = "supcon"
     temperature: float = 0.1
     margin: float = 0.3
     mining: str = "batch_hard"
+    # Episodic (prototypical) loss only — variable support size K' is sampled
+    # uniformly from [support_k_min, support_k_max] per sender per batch, capped
+    # so at least one query remains. supcon_weight scales the SupCon aux term.
+    support_k_min: int = 2
+    support_k_max: int = 6
+    supcon_weight: float = 0.5
 
 
 class HeadConfig(BaseModel):
@@ -76,8 +82,12 @@ class PreprocessingConfig(BaseModel):
     strip_boilerplate: bool = True
     entity_masking: bool = False
     fix_encoding: bool = True          # run ftfy to fix garbled unicode/encoding artifacts
-    min_body_chars: int = 50           # drop emails shorter than this after cleaning
-    min_body_words: int = 20           # drop emails with fewer than this many whitespace-split tokens
+    # Floors lowered 2026-06-09 (docs/robustness_mechanisms.md §B1): production
+    # must score short emails, so training data should contain them — keep only
+    # a sanity floor. min_body_words/min_alnum_ratio were previously declared
+    # but never enforced; preprocessing._is_usable now checks all three.
+    min_body_chars: int = 20           # drop emails shorter than this after cleaning
+    min_body_words: int = 5            # drop emails with fewer than this many whitespace-split tokens
     min_alnum_ratio: float = 0.60      # drop emails where <60% of chars are alphanumeric or space
     max_body_chars: int = 4000         # truncate bodies longer than this
 
@@ -88,6 +98,14 @@ class AugmentationConfig(BaseModel):
 
     synthetic_path: str | None = None
     n_syn_per_batch: int = 2
+    # Crop augmentation (train-time, text-level): with probability crop_prob a
+    # training email is replaced by a random contiguous span of itself (same
+    # label), forcing length-invariant style features — the cheapest training
+    # change targeted at the short-email FP mode (docs/robustness_mechanisms.md
+    # §B1). 0.0 disables.
+    crop_prob: float = 0.0
+    crop_min_words: int = 5
+    crop_max_words: int = 60
 
 
 class DataConfig(BaseModel):
@@ -147,6 +165,25 @@ class TrainingConfig(BaseModel):
     )
 
 
+class ProbeConfig(BaseModel):
+    """CentroidProbe sizing — the inference-style validation set.
+
+    Defaults expanded 2026-06-09: the old 30×4=120 genuine / 200 impostor
+    probe had an AUROC σ of ~0.02 and ±0.13-wide bootstrap CIs on TPR@1%,
+    which is larger than most candidate improvements. Roughly 3× more queries
+    halves the noise floor. Cost: ~2.5× more texts to encode per validation
+    pass (still a small fraction of epoch time).
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    n_profile_senders: int = 60
+    n_enroll_per_sender: int = 8
+    n_query_per_sender: int = 6
+    n_other_queries: int = 600
+    n_synthetic_queries: int = 600
+    seed: int = 0
+
+
 class WandbConfig(BaseModel):
     """W&B experiment tracking settings."""
     model_config = ConfigDict(extra="forbid")
@@ -177,6 +214,7 @@ class ExperimentConfig(BaseModel):
     head: HeadConfig = Field(default_factory=HeadConfig)
     data: DataConfig = Field(default_factory=DataConfig)
     training: TrainingConfig = Field(default_factory=TrainingConfig)
+    probe: ProbeConfig = Field(default_factory=ProbeConfig)
     wandb: WandbConfig = Field(default_factory=WandbConfig)
     runpod: RunpodConfig | None = None
     confidence_tiers: dict[str, str] = Field(

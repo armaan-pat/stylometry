@@ -83,19 +83,23 @@ class PrototypicalHead(BaseHead):
         # registry validates the name (KeyError if unknown).
         from email_fraud.scoring.score_functions import resolve as _resolve_score_fn
         self.score_fn_name = score_fn
-        # Mahalanobis-flavor names aren't in the (cos_sim, spread) registry —
-        # they're dispatched directly in .score() below. For backward-compat
-        # we still pre-resolve the legacy cos_sim/spread fns so existing YAMLs
-        # work without change.
+        # Mahalanobis-flavor and calibrated names aren't in the (cos_sim,
+        # spread) registry — they're dispatched directly in .score() below.
+        # For backward-compat we still pre-resolve the legacy cos_sim/spread
+        # fns so existing YAMLs work without change.
+        from email_fraud.scoring.score_functions import CALIBRATED_SCORE_FNS
         self._mahalanobis_mode = score_fn in {"mahalanobis", "adaptive_k"}
-        if not self._mahalanobis_mode:
+        self._calibrated_mode = score_fn in CALIBRATED_SCORE_FNS
+        if not self._mahalanobis_mode and not self._calibrated_mode:
             self._score_fn = _resolve_score_fn(score_fn)
         else:
             self._score_fn = None  # type: ignore[assignment]
         # Whether to retain raw enrollment embeddings on the profile. Required
         # for mahalanobis scoring and the K-conditional adaptive fallback.
         # Defaults on so changes are non-breaking; turn off only if memory matters.
-        self.store_embeddings = store_embeddings or self._mahalanobis_mode
+        self.store_embeddings = (
+            store_embeddings or self._mahalanobis_mode or self._calibrated_mode
+        )
         # Below this k we fall back to cosine even in mahalanobis modes —
         # per-sender LW shrinkage of a rank-(k-1) sample covariance is too
         # noisy until k≈5 (see experiments/v7/CHANGELOG_V7.md K-sweep).
@@ -103,6 +107,10 @@ class PrototypicalHead(BaseHead):
         self.ridge = ridge
         # In-memory dict of profiles; keyed by sender_id string.
         self._profiles: dict[str, dict[str, Any]] = {}
+        # Per-sender z calibration is bank-level state (the shrinkage prior
+        # pools across all profiles), refreshed lazily after any fit().
+        self._cal_dirty = True
+        self._global_z_scale: float | None = None
 
     # ------------------------------------------------------------------
     # BaseHead interface
@@ -151,6 +159,8 @@ class PrototypicalHead(BaseHead):
                     # CPU storage is fine — these are queried per-sender, not in tight loops.
                     self._profiles[sid]["embs"] = embs.clone()
                     self._profiles[sid]["_prec_dirty"] = True
+                    self._profiles[sid]["_loo_dirty"] = True
+                    self._cal_dirty = True
             else:
                 # Incremental update: merge new batch with existing profile.
                 prof = self._profiles[sid]
@@ -173,6 +183,8 @@ class PrototypicalHead(BaseHead):
                     # Append; covariance will be re-fit lazily on next mahalanobis call.
                     prof["embs"] = torch.cat([prof["embs"], embs], dim=0)
                     prof["_prec_dirty"] = True
+                    prof["_loo_dirty"] = True
+                    self._cal_dirty = True
 
     def score_raw(
         self,
@@ -191,10 +203,12 @@ class PrototypicalHead(BaseHead):
             return {
                 "cos_sim": float("nan"),
                 "spread": float("nan"),
+                "z_scale": float("nan"),
                 "tier": "unknown",
                 "abstain": True,
             }
 
+        self._refresh_calibration()
         prof = self._profiles[sender_id]
         centroid: torch.Tensor = prof["centroid"]
         spread: float = prof["spread"]
@@ -205,6 +219,7 @@ class PrototypicalHead(BaseHead):
         return {
             "cos_sim": cos_sim,
             "spread": spread,
+            "z_scale": float(prof.get("z_scale", float("nan"))),
             "tier": tier,
             "abstain": tier == "low",
         }
@@ -223,13 +238,22 @@ class PrototypicalHead(BaseHead):
               `linear_z3` when k < mahalanobis_min_k.
             "adaptive_k" — cosine for k < mahalanobis_min_k (Σ too unreliable),
               mahalanobis otherwise. The recommended production default.
+            calibrated names (CALIBRATED_SCORE_FNS, e.g. "z_persender_sigmoid")
+              — per-sender shrunk-z-scale calibration, computed from the
+              profile's leave-one-out genuine z distribution.
             anything else — passes through to the (cos_sim, spread) registry.
         """
         raw = self.score_raw(query, sender_id)
         if raw["tier"] == "unknown":
             return {"score": 0.0, "tier": "unknown", "abstain": True}
 
-        if self._mahalanobis_mode:
+        if self._calibrated_mode:
+            from email_fraud.scoring.score_functions import resolve_calibrated
+            fn = resolve_calibrated(self.score_fn_name)
+            score_val = fn(
+                float(raw["cos_sim"]), float(raw["spread"]), float(raw["z_scale"])
+            )
+        elif self._mahalanobis_mode:
             prof = self._profiles[sender_id]
             k = int(prof["k"])
             if k >= self.mahalanobis_min_k and "embs" in prof:
@@ -278,6 +302,95 @@ class PrototypicalHead(BaseHead):
             prof["_shrinkage"] = float(lw.shrinkage_)
         prof["_prec_dirty"] = False
 
+    # ------------------------------------------------------------------
+    # Per-sender z calibration (z_persender_sigmoid et al.)
+    # ------------------------------------------------------------------
+
+    def _refresh_calibration(self) -> None:
+        """Recompute per-sender z scales (lazy; no-op unless a fit() dirtied us).
+
+        Two passes, mirroring scoring/adaptive.py::ProfileBank.fit:
+          1. Per sender: leave-one-out genuine z distribution from the stored
+             enrollment embeddings (honest — scoring an email against a
+             centroid it helped define is optimistic, and at small k the bias
+             is large).
+          2. Global prior = pooled p90 of all LOO z; each sender's scale is
+             the p90 of its own LOO z shrunk toward the prior with
+             pseudo-count CAL_SHRINK_N0, so sparse senders trust the
+             population and dense senders trust themselves.
+
+        Profiles without stored embeddings get the global scale (or the
+        CAL_DEFAULT_Z_SCALE fallback when no profile has embeddings).
+        """
+        if not self._cal_dirty:
+            return
+        from email_fraud.scoring.score_functions import (
+            CAL_DEFAULT_Z_SCALE,
+            CAL_Q_PCT,
+            CAL_SHRINK_N0,
+        )
+
+        pooled: list[np.ndarray] = []
+        for prof in self._profiles.values():
+            if "embs" not in prof:
+                continue
+            if prof.get("_loo_dirty", True) or "_loo_z" not in prof:
+                prof["_loo_z"] = self._leave_one_out_z(prof["embs"])
+                prof["_loo_dirty"] = False
+            pooled.append(prof["_loo_z"])
+
+        if pooled:
+            all_z = np.concatenate(pooled)
+            self._global_z_scale = float(
+                max(np.percentile(all_z, CAL_Q_PCT), 1e-9)
+            )
+        else:
+            self._global_z_scale = CAL_DEFAULT_Z_SCALE
+
+        for prof in self._profiles.values():
+            loo = prof.get("_loo_z")
+            if loo is None or len(loo) == 0:
+                prof["z_scale"] = self._global_z_scale
+                continue
+            persender = float(np.percentile(loo, CAL_Q_PCT))
+            k = int(prof["k"])
+            prof["z_scale"] = float(
+                max(
+                    (k * persender + CAL_SHRINK_N0 * self._global_z_scale)
+                    / (k + CAL_SHRINK_N0),
+                    1e-9,
+                )
+            )
+        self._cal_dirty = False
+
+    @staticmethod
+    def _leave_one_out_z(embs: torch.Tensor) -> np.ndarray:
+        """Honest within-sender z for each enrollment email vs the rest.
+
+        Uses the same geometry as score_raw (cosine distance to centroid,
+        normalised by the mean cosine distance of the defining emails), so the
+        resulting scale is directly comparable to query-time z values.
+        """
+        k = embs.shape[0]
+        if k < 3:
+            # Not enough to leave one out meaningfully; fall back to in-sample.
+            c = embs.mean(dim=0)
+            sims = F.cosine_similarity(embs, c.unsqueeze(0))
+            spread = float((1.0 - sims).mean())
+            return ((1.0 - sims) / max(spread, 1e-9)).numpy().astype(np.float64)
+
+        total = embs.sum(dim=0)
+        out = np.empty(k, dtype=np.float64)
+        for i in range(k):
+            mask = torch.arange(k) != i
+            rest = embs[mask]
+            c = (total - embs[i]) / (k - 1)
+            rest_sims = F.cosine_similarity(rest, c.unsqueeze(0))
+            spread = float((1.0 - rest_sims).mean())
+            sim_i = float(F.cosine_similarity(embs[i].unsqueeze(0), c.unsqueeze(0)))
+            out[i] = (1.0 - sim_i) / max(spread, 1e-9)
+        return out
+
     def _mahalanobis_distance(self, query: torch.Tensor, prof: dict[str, Any]) -> float:
         if prof.get("_prec_dirty", True):
             self._refresh_precision(prof)
@@ -318,7 +431,9 @@ class PrototypicalHead(BaseHead):
             if "embs" in data:
                 prof["embs"] = torch.from_numpy(np.array(data["embs"]))
                 prof["_prec_dirty"] = True
+                prof["_loo_dirty"] = True
             self._profiles[sid] = prof
+        self._cal_dirty = True
 
     # ------------------------------------------------------------------
     # Mahalanobis stub

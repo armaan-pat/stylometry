@@ -398,8 +398,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--entity-masking",    action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--fix-encoding",      action=argparse.BooleanOptionalAction, default=True,
                    help="Run ftfy to fix garbled encoding artifacts.")
-    p.add_argument("--min-body-chars",    type=int, default=50,
-                   help="Drop emails with fewer than this many characters after cleaning.")
+    p.add_argument("--min-body-chars",    type=int, default=20,
+                   help="Drop emails with fewer than this many characters after cleaning "
+                        "(default lowered 50→20 on 2026-06-09 so short emails reach training; "
+                        "see docs/robustness_mechanisms.md §B1).")
+    p.add_argument("--min-body-words",    type=int, default=5,
+                   help="Drop emails with fewer than this many whitespace-split words "
+                        "after cleaning (sanity floor; previously unenforced).")
+    p.add_argument("--min-alnum-ratio",   type=float, default=0.60,
+                   help="Drop emails where less than this fraction of characters is "
+                        "alphanumeric or whitespace (previously unenforced).")
     p.add_argument("--max-body-chars",    type=int, default=4000,
                    help="Truncate email bodies to this many characters.")
     p.add_argument("--dry-run", action="store_true",
@@ -424,6 +432,8 @@ def main() -> None:
         entity_masking=args.entity_masking,
         fix_encoding=args.fix_encoding,
         min_body_chars=args.min_body_chars,
+        min_body_words=args.min_body_words,
+        min_alnum_ratio=args.min_alnum_ratio,
         max_body_chars=args.max_body_chars,
     )
 

@@ -31,10 +31,26 @@ data:
     strip_boilerplate: true
     entity_masking: false
     fix_encoding: true
-    min_body_chars: 50
-    min_body_words: 50
+    # Sanity floors only (lowered 2026-06-09): production must score short
+    # emails, so training data should contain them. min_body_words and
+    # min_alnum_ratio are now actually enforced by preprocessing._is_usable
+    # (they were declared-but-dead before). See docs/robustness_mechanisms.md §B1.
+    min_body_chars: 20
+    min_body_words: 5
     min_alnum_ratio: 0.60
     max_body_chars: 4000
+
+# CentroidProbe sizing (inference-style validation run each epoch).
+# Expanded 2026-06-09 from 30×4/200/200: the old probe's noise floor (±0.13
+# tpr1 CIs) was wider than most candidate improvements. Override per-experiment
+# if epoch time matters more than metric resolution.
+probe:
+  n_profile_senders: 60
+  n_enroll_per_sender: 8
+  n_query_per_sender: 6
+  n_other_queries: 600
+  n_synthetic_queries: 600
+  seed: 0
 
 training:
   epochs: 10

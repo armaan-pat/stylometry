@@ -16,8 +16,11 @@ centroid from enrolled emails and scores how far a new email sits from it.
 - **Ship encoder:** V7.3 recipe (LUAR-MUD + LoRA r16 on q/v/k, SupCon τ=0.05,
   n_syn=4, 150 epochs) trained on the **syn-v2** synthetic dataset
   (cross-register positives). Checkpoint: `runs/v7_synv2/checkpoint_epoch_150.pt`
-  (or `checkpoint_last.pt`). **Do not use `checkpoint_best.pt`** — the
-  `auc/genuine_vs_synthetic` monitor peaks at ~epoch 7 and names the wrong file.
+  (or `checkpoint_last.pt`). **Do not use `checkpoint_best.pt` from runs
+  before 2026-06-09** — the old `auc/genuine_vs_synthetic` monitor peaks at
+  ~epoch 7 and names the wrong file. Configs now monitor
+  `pauc/genuine_vs_synthetic_5pct`, so `checkpoint_best.pt` is trustworthy
+  for runs launched after that date.
 - **Ship scorer:** `linear_z3` for K < 16, `mahal_per_sender` (Ledoit-Wolf) for
   K ≥ 16. Bootstrapped ablation says nothing beats `linear_z3` with a CI
   excluding 0 at K=8, so `linear_z3` is the safe default; Mahalanobis only pulls
@@ -164,6 +167,29 @@ stated objective (robust spam/AI-impersonation detection).
    Mahalanobis leads on the point estimate at K≥16 but is not yet distinguishable
    from noise on this probe. To make the K≥16 Mahalanobis win real, the probe
    needs to be larger / the test corpus more diverse (→ item 2).
+   *Update (2026-06-09, later):* three of the prerequisites/cheap fixes landed
+   in-repo — (a) the CentroidProbe is now ~3× bigger and configurable via the
+   `probe:` section (60 senders × 6 queries / 600 other / 600 synthetic),
+   (b) checkpoint selection monitors `pauc/genuine_vs_synthetic_5pct`, and
+   (c) per-sender calibration (`z_persender_sigmoid`, shrunk LOO-z scale)
+   shipped into `PrototypicalHead` + the probe's `eval_score_fns` (partially
+   addresses item 4 below). See `CHANGELOG.md` and the new
+   `docs/robustness_mechanisms.md` for the low-K / short-email design
+   directions replacing the abstain-gate idea (item 3).
+
+   *Update (2026-06-09, latest):* robustness items A1+B1 are **implemented and
+   smoke-tested, retrain not yet launched** — episodic variable-K′ prototype
+   loss (`losses/episodic.py`), crop augmentation + enforced/lowered word
+   floors, and the re-prepared `data/processed/enron_shortmail` corpus
+   (signatures kept, 13.2% of train now <10 words). Launch with:
+   `python scripts/train.py --config configs/experiments/v9_episodic_shortmail.yaml --output-dir runs/v9_episodic_shortmail`
+   (~75–150 min; batch 128). Compare against `runs/v7_synv2` on the expanded
+   probe, ideally with the K-stratified reporting from
+   `docs/robustness_mechanisms.md` §C. For the full back-to-back comparison
+   (v6 → v7.3 → v8 → v9 on a common eval corpus, ~6 h in a screen) use
+   `scripts/run_lineage_v6_v9.sh`; analysis template in
+   `docs/v9_lineage_memo.md`.
+
 2. **Diversify the adversary (biggest robustness lever).** Regenerate synthetics
    from ≥2 more LLMs (Claude, GPT-4, Llama-3) and/or multiple temperatures/prompts.
    The current detector is tuned against one Mistral template; this is the most

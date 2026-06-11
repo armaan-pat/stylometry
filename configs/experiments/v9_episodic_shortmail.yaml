@@ -1,0 +1,116 @@
+# V9 — episodic variable-K training + short-email fixes (one shared retrain).
+#
+# Implements items 1+2 of the attack order in docs/robustness_mechanisms.md:
+#   A1  Episodic, K-matched training: loss "episodic" splits each sender's
+#       in-batch embeddings into a support set of K' ~ uniform{2..6} and a
+#       query set, builds prototypes from support means, and cross-entropies
+#       queries against all in-batch prototypes with the deployed cosine
+#       distance. SupCon stays as a 0.5-weighted aux term. Synthetic __syn
+#       emails are repulsion-only queries (never prototypes).
+#   B1  Train/test length mismatch: train on data re-prepared with the lowered
+#       word floor and signatures kept, plus crop augmentation (30% of train
+#       emails replaced by a 5-60-word contiguous span of themselves).
+#
+# Differences vs the shipped V7.3 recipe (v7_synv2.yaml):
+#   - episode_k 4 → 1: prototypes/centroids are means of SINGLE-email
+#     embeddings, exactly the representation enrollment and inference use
+#     (also closes the A4 episode mismatch for free).
+#   - loss supcon → episodic (supcon kept inside as the aux term).
+#   - batch_size 64 → 128: with k=8 and episode_k=1 this gives P=16 senders
+#     per batch (4 syn pairs + 8 fillers) → 16-way episodes.
+#   - data re-prepared: min words 5, min chars 20, signatures KEPT.
+#   - crop augmentation on.
+#
+# Prerequisite — regenerate the processed dataset once:
+#   python scripts/prepare_data.py --output-dir data/processed/enron_shortmail \
+#       --min-body-chars 20 --min-body-words 5 --no-strip-signatures
+# (emails_per_sender_k must stay 8: synthetic senders have only 8-9 emails each.)
+#
+# Measure with the K-stratified probe directions in robustness_mechanisms.md §C;
+# compare against runs/v7_synv2 on the same probe.
+
+encoder:
+  model_name_or_path: rrivera1849/LUAR-MUD
+  pooling: luar_episode
+  freeze_backbone: false
+  lora:
+    r: 16
+    alpha: 32
+    target_modules:
+      - query
+      - value
+      - key
+    dropout: 0.05
+  max_length: 512
+  projection_dim: 128
+  episode_k: 1
+  trust_remote_code: true
+
+loss:
+  name: episodic
+  temperature: 0.05
+  support_k_min: 2
+  support_k_max: 6
+  supcon_weight: 0.5
+
+head:
+  name: prototypical
+  score_fn: adaptive_k
+  eval_score_fns:
+    - linear_z3
+    - cosine
+    - sigmoid_z
+    - z_persender_sigmoid
+
+data:
+  processed_dir: data/processed/enron_shortmail
+  train_senders: 100
+  emails_per_sender_k: 8
+  val_split: 0.1
+  test_split: 0.1
+  preprocessing:
+    # Must mirror the prepare_data.py flags used to build processed_dir —
+    # the trainer's inline PAN eval re-cleans test pairs with this config.
+    strip_signatures: false
+    min_body_chars: 20
+    min_body_words: 5
+  augmentation:
+    synthetic_path: data/synthetic/enron_synthetic_v2
+    n_syn_per_batch: 4
+    crop_prob: 0.3
+    crop_min_words: 5
+    crop_max_words: 60
+
+training:
+  epochs: 150
+  batch_size: 128
+  lr: 2.0e-4
+  scheduler: cosine
+  warmup_steps: 200
+  grad_clip: 1.0
+  mixed_precision: true
+  monitor: pauc/genuine_vs_synthetic_5pct
+  monitor_mode: max
+  early_stopping_patience: 0
+  early_stopping_min_delta: 1.0e-3
+  keep_last_n: 1
+  hard_negative_mining:
+    enabled: true
+    warmup_epochs: 20
+    ramp_epochs: 30
+    interval: 5
+    n_pairs: 20
+    max_hard_fraction: 0.5
+
+wandb:
+  name: v9-episodic-shortmail
+  tags:
+    - luar
+    - lora
+    - episodic
+    - variable-k
+    - crop-augment
+    - short-email
+    - v9
+    - syn-v2
+  notes: "V9: episodic variable-K' prototype loss (A1) + short-email data/augmentation fixes (B1). Single retrain covering robustness_mechanisms.md items 1+2."

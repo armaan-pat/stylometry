@@ -78,6 +78,7 @@ override only the fields that differ from `base.yaml`.
 | [docs/architecture.md](docs/architecture.md) | How the system works end-to-end: batching, LUAR pooling, SupCon, enrollment & scoring |
 | [docs/results.md](docs/results.md) | Experimental results, current gaps, prioritized next steps |
 | [docs/metrics.md](docs/metrics.md) | Every W&B metric the trainer logs and how to read it |
+| [docs/robustness_mechanisms.md](docs/robustness_mechanisms.md) | Design memo: low-K enrollment & short-email robustness as modeling changes (episodic training, hierarchical priors, heteroscedastic scoring) |
 | [docs/v6_vs_v7_memo.md](docs/v6_vs_v7_memo.md), [experiments/v7/CHANGELOG_V7.md](experiments/v7/CHANGELOG_V7.md) | V7 research logs |
 
 ## Open TODOs

@@ -115,6 +115,27 @@ Semi-hard mining (Schroff et al. FaceNet 2015) avoids trivially easy negatives t
 
 ---
 
+### `episodic.py` — `EpisodicPrototypeLoss`
+
+**Episodic, variable-K prototypical loss** (Snell et al., NeurIPS 2017, arXiv:1703.05175 — adapted; see `docs/robustness_mechanisms.md` §A1).
+
+Registered as `"episodic"`.
+
+Trains the way the system infers: per batch, each sender's embeddings are split into a *support set* of size K′ ~ uniform{`support_k_min`..`support_k_max`} and a *query set*. Prototypes are (renormalized) support means; each query is classified against all in-batch prototypes with the deployed cosine distance via cross-entropy. Sampling K′ small explicitly optimizes the encoder so that the mean of a few embeddings is already a stable description of the sender — low-K robustness in the representation.
+
+Synthetic hard negatives (`sender_id` ending in `__syn`) never form prototypes; they stay in the query pool and are repelled from their mimicked sender's prototype via `-log(1 − p(mimicked))`. This requires the raw sender-id strings, so the loss sets `requires_sender_ids = True` and the Trainer passes `sender_ids=` alongside the labels.
+
+SupCon is kept as an auxiliary term: `L = L_proto + supcon_weight · L_supcon`.
+
+#### Key parameters
+| Parameter | Default | Effect |
+|-----------|---------|--------|
+| `temperature` | 0.05 | Softmax sharpness over query→prototype cosines (shared with the SupCon aux term) |
+| `support_k_min` / `support_k_max` | 2 / 6 | Range of the per-sender support size K′ (capped so ≥1 query remains) |
+| `supcon_weight` | 0.5 | Weight of the auxiliary SupCon term (0 disables) |
+
+---
+
 ## Comparison
 
 | Loss | Objective | Complexity | Best for |
@@ -122,6 +143,7 @@ Semi-hard mining (Schroff et al. FaceNet 2015) avoids trivially easy negatives t
 | SupCon | Maximize similarity to all positives jointly | O(N²) | Large K, rich positive signal |
 | Triplet (batch-hard) | Separate hardest positive from hardest negative | O(N²) | When convergence is slow with SupCon |
 | Contrastive | Push all pairs together / apart by margin | O(N²) | Simpler baseline; pairs are cheaper than triplets |
+| Episodic | Make small-sample centroids discriminative (the deployed objective) | O(N²) | Low-K enrollment robustness; matches inference |
 
 ---
 
@@ -129,8 +151,11 @@ Semi-hard mining (Schroff et al. FaceNet 2015) avoids trivially easy negatives t
 
 ```yaml
 loss:
-  name: supcon        # supcon | triplet | contrastive
-  temperature: 0.1    # SupConLoss only
+  name: supcon        # supcon | triplet | contrastive | episodic
+  temperature: 0.1    # SupConLoss / EpisodicPrototypeLoss
   margin: 0.3         # TripletLoss / ContrastiveLoss
   mining: batch_hard  # batch_hard | all (triplet) / all | semi_hard (contrastive)
+  support_k_min: 2    # EpisodicPrototypeLoss only
+  support_k_max: 6    # EpisodicPrototypeLoss only
+  supcon_weight: 0.5  # EpisodicPrototypeLoss only
 ```

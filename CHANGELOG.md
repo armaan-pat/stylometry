@@ -7,6 +7,111 @@ documented here.  Format loosely follows [Keep a Changelog](https://keepachangel
 
 ## [Unreleased]
 
+### Added (2026-06-09) — episodic variable-K training + short-email fixes (V9 recipe)
+
+Implements items 1+2 of the attack order in `docs/robustness_mechanisms.md`
+(A1 + B1) — they share one retrain, launched via the new
+`configs/experiments/v9_episodic_shortmail.yaml`.
+
+**A1 — Episodic, variable-K prototype loss** (`losses/episodic.py`, registered
+as `episodic`)
+
+- Trains the way we infer: per batch, each sender's embeddings are split into
+  a support set of size K′ ~ uniform{`support_k_min`..`support_k_max`} and a
+  query set; prototypes are (renormalized) support means; queries are
+  classified against all in-batch prototypes with the deployed cosine
+  distance via cross-entropy. Because K′ is sampled small, the encoder is
+  optimized so small-sample means are already discriminative.
+- Synthetic `__syn` hard negatives never form prototypes (deployment never
+  enrolls them); they stay in the query pool and are repelled from their
+  mimicked sender's prototype via `-log(1 - p(mimicked))`. Cross-register
+  positives (real sender_id) participate as ordinary episode members.
+- SupCon kept as an aux term: `L = L_proto + supcon_weight·L_supcon`
+  (default 0.5). New `LossConfig` fields: `support_k_min`, `support_k_max`,
+  `supcon_weight`. `BaseLoss.requires_sender_ids` + Trainer plumbing pass the
+  raw sender-id strings (episode-strided) into losses that need them.
+- The V9 config also sets `encoder.episode_k: 1` so training embeddings are
+  single-email — the same representation enrollment/inference use (closes the
+  §A4 episode mismatch as a side effect) — and `batch_size: 128` (P=16
+  senders × k=8; k must stay 8 because synthetic senders have only 8–9 emails).
+
+**B1 — train/test length mismatch** (`data/preprocessing.py`,
+`data/augment.py`, `scripts/prepare_data.py`)
+
+- `min_body_words` and `min_alnum_ratio` were declared in
+  `PreprocessingConfig` but **never enforced** — `_is_usable` only checked
+  chars. They are now enforced, and the floors are lowered to sanity levels
+  (chars 50→20, words →5) in `base.yaml` / config defaults / `prepare_data.py`
+  CLI (new `--min-body-words`, `--min-alnum-ratio` flags).
+- **Crop augmentation**: with `data.augmentation.crop_prob` (default 0 = off),
+  a training email is replaced by a random contiguous 5–60-word span of
+  itself (same label; half the crops anchored at the greeting). Crops slice
+  the original string so line breaks survive. Implemented as
+  `CropAugmentedDataset`, wrapped last in `train.py` so synthetics are
+  cropped too while the probe / hard-negative mining still read uncropped
+  `._texts`.
+- Regenerated `data/processed/enron_shortmail` with
+  `--min-body-chars 20 --min-body-words 5 --no-strip-signatures` (keep
+  sign-offs — most of a 10-word email's signal): same 44 train senders,
+  34,476 train emails (+4.4k vs the old floor), 13.2% under 10 words; all 44
+  synthetic-real sampler pairs still eligible at k=8.
+
+Tests: `tests/test_episodic_loss.py`, `tests/test_crop_augment.py`. Smoke
+config: `configs/experiments/_smoke_episodic.yaml`.
+
+**Lineage benchmark** — `scripts/run_lineage_v6_v9.sh` sequentially trains
+v6 (`v6_bench.yaml`, the V6 recipe with the modern monitor) → v7 (V7.3
+recipe) → v8 (V7.3 + syn-v2) → v9, then runs the genuine-vs-synthetic probe
+plus scorer ablations on each checkpoint **twice**: against each arm's own
+corpus (historical parity) and against a common production-like corpus
+(enron_shortmail + syn-v2) for apples-to-apples comparison. Companion memo
+with mechanisms, historical numbers, and fill-in result tables:
+`docs/v9_lineage_memo.md`.
+
+---
+
+### Changed (2026-06-09) — scoring calibration, checkpoint monitor, probe size
+
+**Per-sender score calibration shipped into the production head**
+(`heads/prototypical.py`, `scoring/score_functions.py`)
+
+- New `CALIBRATED_SCORE_FNS` family: `z_persender_sigmoid(cos, spread, z_scale)`
+  where `z_scale` is the sender's leave-one-out genuine-z p90, shrunk toward a
+  pooled global prior with pseudo-count `n0=8` (James-Stein style — sparse
+  senders trust the population, dense senders trust themselves). Ported from
+  the `scoring/adaptive.py` ablation winner (`docs/scoring_ablation_results.md`:
+  opens score reachability 5.8% → 42% above 0.8 and improves cross-sender
+  threshold consistency without hurting AUC).
+- `PrototypicalHead` computes/refreshes calibration lazily after `fit()`;
+  `score_raw()` now also returns `z_scale`; `score_fn: z_persender_sigmoid`
+  is selectable from YAML. `CentroidProbe` evaluates calibrated fns alongside
+  the plain registry (added to `eval_score_fns` in the v7 configs), and the
+  probe raw dump rows are now `(cos_sim, spread, z_scale)` —
+  `analyze_thresholds.py` handles both old and new formats.
+
+**Checkpoint monitor switched to the low-FPR tail**
+
+- v7/smoke configs now monitor `pauc/genuine_vs_synthetic_5pct` (mode=max)
+  instead of `auc/genuine_vs_synthetic`, whose epoch-7 peak made
+  `checkpoint_best.pt` name the wrong file (the documented V7.3 footgun).
+- Removed the misleading hard-coded "New best val/loss=…" log line inside
+  `_save_best_checkpoint` (it printed val/loss as "best" whatever the
+  configured monitor was).
+
+**CentroidProbe expanded ~3× and made configurable**
+
+- New `probe:` config section (`ProbeConfig`); defaults raised from
+  30×4 genuine / 200 other / 200 synthetic to **60 senders × 6 queries
+  (360 genuine) / 600 / 600** (capped by availability). The old probe's
+  bootstrap CIs (±0.13 on TPR@1%) were wider than most candidate
+  improvements. `ablate_adaptive_scorers.py` CLI defaults raised to match.
+
+See `docs/robustness_mechanisms.md` (new) for the design directions these
+changes feed into: low-K and short-email robustness as modeling problems
+rather than abstain gates.
+
+---
+
 ### Diagnosis (2026-06-03)
 
 Full failure-mode audit of the v7 model on 2 000 test pairs revealed five

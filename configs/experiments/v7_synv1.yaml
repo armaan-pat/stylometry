@@ -35,6 +35,7 @@ head:
     - linear_z3
     - cosine
     - sigmoid_z
+    - z_persender_sigmoid
 
 data:
   train_senders: 100
@@ -53,7 +54,10 @@ training:
   warmup_steps: 200
   grad_clip: 1.0
   mixed_precision: true
-  monitor: auc/genuine_vs_synthetic
+  # pAUC at the 5% low-FPR tail — the deployment-relevant region. The old
+  # auc/genuine_vs_synthetic monitor peaked at ~epoch 7 and made
+  # checkpoint_best.pt name the wrong file (see docs/EXPERIMENT_STATUS.md).
+  monitor: pauc/genuine_vs_synthetic_5pct
   monitor_mode: max
   early_stopping_patience: 0
   early_stopping_min_delta: 1.0e-3

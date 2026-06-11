@@ -81,6 +81,7 @@ class CentroidProbe:
         seed: int = 0,
     ) -> None:
         from email_fraud.scoring.score_functions import (
+            CALIBRATED_SCORE_FNS,
             DEFAULT_SCORE_FNS,
             SCORE_FNS,
         )
@@ -91,10 +92,11 @@ class CentroidProbe:
         # the un-prefixed metric names (auc/genuine_vs_all, etc.) so existing
         # dashboards keep working unchanged.
         fns = list(score_fns) if score_fns else list(DEFAULT_SCORE_FNS)
-        unknown = [f for f in fns if f not in SCORE_FNS]
+        known = set(SCORE_FNS) | set(CALIBRATED_SCORE_FNS)
+        unknown = [f for f in fns if f not in known]
         if unknown:
             raise KeyError(
-                f"Unknown score_fns {unknown}. Available: {sorted(SCORE_FNS)}"
+                f"Unknown score_fns {unknown}. Available: {sorted(known)}"
             )
         self._score_fns = fns
         rng = random.Random(seed)
@@ -204,7 +206,11 @@ class CentroidProbe:
         Threshold-band metrics live under threshold_{τ}/ and coverage metrics
         under coverage/, populated by the helpers below.
         """
-        from email_fraud.scoring.score_functions import resolve as _resolve_score_fn
+        from email_fraud.scoring.score_functions import (
+            CALIBRATED_SCORE_FNS,
+            resolve as _resolve_score_fn,
+            resolve_calibrated as _resolve_calibrated,
+        )
 
         was_training = encoder.training
         encoder.eval()
@@ -218,24 +224,32 @@ class CentroidProbe:
         head = PrototypicalHead(confidence_tiers=self.confidence_tiers)
         head.fit(enrol_emb, d.enrollment_senders)
 
-        # Pull raw (cos_sim, spread) per query once; each score_fn is applied
-        # in a tight inner loop below so we don't pay the encoding cost N times.
+        # Pull raw (cos_sim, spread, z_scale) per query once; each score_fn is
+        # applied in a tight inner loop below so we don't pay the encoding cost
+        # N times. z_scale is the per-sender calibrated scale used by the
+        # CALIBRATED_SCORE_FNS family; plain fns ignore it.
         def _raw_pairs(embs, sender_iter):
             out = []
             for emb, sid in zip(embs, sender_iter):
                 r = head.score_raw(emb, sid)
-                out.append((float(r["cos_sim"]), float(r["spread"])))
+                out.append(
+                    (
+                        float(r["cos_sim"]),
+                        float(r["spread"]),
+                        float(r.get("z_scale", float("nan"))),
+                    )
+                )
             return out
 
         gen_raw = _raw_pairs(gen_emb, d.genuine_senders)
 
         rng = random.Random(self._seed)
-        oth_raw: list[tuple[float, float]] = []
+        oth_raw: list[tuple[float, float, float]] = []
         if oth_emb is not None and len(oth_emb) > 0:
             assigned = [rng.choice(self._profile_senders) for _ in range(len(oth_emb))]
             oth_raw = _raw_pairs(oth_emb, assigned)
 
-        syn_raw: list[tuple[float, float]] = []
+        syn_raw: list[tuple[float, float, float]] = []
         if syn_emb is not None and len(syn_emb) > 0:
             syn_raw = _raw_pairs(syn_emb, d.synthetic_source_senders)
 
@@ -257,10 +271,16 @@ class CentroidProbe:
         out: dict[str, float] = {}
         per_fn_scores: dict[str, dict[str, np.ndarray]] = {}
         for i, fn_name in enumerate(self._score_fns):
-            fn = _resolve_score_fn(fn_name)
-            g = np.array([fn(c, s) for c, s in gen_raw])
-            o = np.array([fn(c, s) for c, s in oth_raw])
-            sn = np.array([fn(c, s) for c, s in syn_raw])
+            if fn_name in CALIBRATED_SCORE_FNS:
+                cfn = _resolve_calibrated(fn_name)
+                g = np.array([cfn(c, s, zs) for c, s, zs in gen_raw])
+                o = np.array([cfn(c, s, zs) for c, s, zs in oth_raw])
+                sn = np.array([cfn(c, s, zs) for c, s, zs in syn_raw])
+            else:
+                fn = _resolve_score_fn(fn_name)
+                g = np.array([fn(c, s) for c, s, _ in gen_raw])
+                o = np.array([fn(c, s) for c, s, _ in oth_raw])
+                sn = np.array([fn(c, s) for c, s, _ in syn_raw])
             per_fn_scores[fn_name] = {"genuine": g, "other": o, "synthetic": sn}
             prefix = "" if i == 0 else f"{fn_name}/"
             out.update(_metrics_for_score_set(g, o, sn, prefix=prefix))
@@ -343,6 +363,24 @@ def _metrics_for_score_set(
         out[f"{prefix}pauc/genuine_vs_synthetic_10pct"] = compute_pauc(labels, scores, max_fpr=0.10)
         out[f"{prefix}tpr_at_fpr/synthetic_1pct"] = compute_tpr_at_fpr(labels, scores, target_fpr=0.01)
         out[f"{prefix}tpr_at_fpr/synthetic_5pct"] = compute_tpr_at_fpr(labels, scores, target_fpr=0.05)
+
+    if len(genuine) and len(other):
+        labels = np.concatenate([np.ones_like(genuine), np.zeros_like(other)])
+        scores = np.concatenate([genuine, other])
+        out[f"{prefix}pauc/genuine_vs_other_5pct"] = compute_pauc(labels, scores, max_fpr=0.05)
+
+    # Anti-Goodhart composite: the worse of the two impostor tails. The
+    # 2026-06-10 lineage run showed that monitoring the synthetic tail alone
+    # selects early checkpoints that have not yet learned to reject real
+    # human impostors (v9's ep-10 "best" accepted 59.5% of wrong-sender mail
+    # at the deployed threshold — docs/v9_lineage_results_analysis.md §3).
+    # min() can only be gamed by being good at both.
+    if (f"{prefix}pauc/genuine_vs_synthetic_5pct" in out
+            and f"{prefix}pauc/genuine_vs_other_5pct" in out):
+        out[f"{prefix}pauc/min_other_synthetic_5pct"] = min(
+            out[f"{prefix}pauc/genuine_vs_synthetic_5pct"],
+            out[f"{prefix}pauc/genuine_vs_other_5pct"],
+        )
 
     if len(genuine) and (len(other) or len(synthetic)):
         neg = np.concatenate([other, synthetic])

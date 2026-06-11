@@ -52,6 +52,17 @@ class BaseLoss(nn.Module, ABC):
         ...
 
     @property
+    def requires_sender_ids(self) -> bool:
+        """True if forward() needs the raw sender-id strings as a kwarg.
+
+        Default False — most losses only need integer labels. Losses that
+        must distinguish synthetic hard negatives (sender ids ending in
+        "__syn") from real senders override this; the Trainer then passes
+        sender_ids=<list[str]> aligned with the (episode-strided) labels.
+        """
+        return False
+
+    @property
     @abstractmethod
     def requires_pk_sampler(self) -> bool:
         """True if this loss requires a PK-structured batch.

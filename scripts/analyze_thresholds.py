@@ -51,7 +51,9 @@ sys.path.insert(0, str(_PROJECT_ROOT / "src"))
 from email_fraud.scoring.score_functions import (  # noqa: E402
     SCORE_FNS,
     ALL_SCORE_FNS,
+    CALIBRATED_SCORE_FNS,
     resolve as resolve_score_fn,
+    resolve_calibrated,
 )
 
 
@@ -78,13 +80,23 @@ def _load_raw(path: Path) -> dict | None:
 
 
 def _scores_from_raw(raw: dict, score_fn_name: str) -> dict[str, np.ndarray]:
-    fn = resolve_score_fn(score_fn_name)
+    # Raw rows are (cos_sim, spread) in older dumps and (cos_sim, spread,
+    # z_scale) in current ones; calibrated fns need the third element and
+    # plain fns ignore it.
+    calibrated = score_fn_name in CALIBRATED_SCORE_FNS
+    fn = resolve_calibrated(score_fn_name) if calibrated else resolve_score_fn(score_fn_name)
     out: dict[str, np.ndarray] = {}
     for pool in ("genuine", "other", "synthetic"):
-        pairs = raw.get(pool, [])
-        out[pool] = np.array(
-            [fn(float(c), float(s)) for c, s in pairs], dtype=np.float64
-        )
+        rows = raw.get(pool, [])
+        vals = []
+        for row in rows:
+            c, s = float(row[0]), float(row[1])
+            if calibrated:
+                zs = float(row[2]) if len(row) > 2 else float("nan")
+                vals.append(fn(c, s, zs))
+            else:
+                vals.append(fn(c, s))
+        out[pool] = np.array(vals, dtype=np.float64)
     return out
 
 
@@ -235,11 +247,15 @@ def _compare_all_table(raw: dict) -> None:
     """One-row-per-score-fn AUC summary so you can see at a glance which one
     discriminates best. AUC is invariant to monotone re-scalings, so when fns
     are monotone in z they should match — useful as a sanity check."""
-    fmt = "  {fn:<12s}  {auc_o:>10s}  {auc_s:>10s}  {auc_a:>10s}"
+    fmt = "  {fn:<20s}  {auc_o:>10s}  {auc_s:>10s}  {auc_a:>10s}"
     print("\n== Side-by-side AUC across score functions ==")
     print(fmt.format(fn="score_fn", auc_o="vs_other", auc_s="vs_synth", auc_a="vs_all"))
     print("  " + "─" * 50)
-    for fn_name in ALL_SCORE_FNS:
+    # Calibrated fns are only comparable when the dump carries z_scale (3-elem rows).
+    rows = raw.get("genuine", [])
+    has_z_scale = bool(rows) and len(rows[0]) > 2
+    fn_names = list(ALL_SCORE_FNS) + (list(CALIBRATED_SCORE_FNS) if has_z_scale else [])
+    for fn_name in fn_names:
         scores = _scores_from_raw(raw, fn_name)
         g = scores["genuine"]
         o = scores["other"]

@@ -157,6 +157,9 @@ def _run_training(cfg, EncoderClass, LossClass, HeadClass, args, output_dir: Pat
                 "temperature": cfg.loss.temperature,
                 "margin": cfg.loss.margin,
                 "mining": cfg.loss.mining,
+                "support_k_min": cfg.loss.support_k_min,
+                "support_k_max": cfg.loss.support_k_max,
+                "supcon_weight": cfg.loss.supcon_weight,
             }.items()
             if k in LossClass.__init__.__code__.co_varnames
         }
@@ -212,6 +215,25 @@ def _run_training(cfg, EncoderClass, LossClass, HeadClass, args, output_dir: Pat
             k=cfg.data.emails_per_sender_k,
             seed=0,
         )
+
+    # Crop augmentation wraps LAST so synthetic emails are cropped too, while
+    # the probe / hard-negative mining keep reading uncropped ._texts.
+    if cfg.data.augmentation.crop_prob > 0:
+        from email_fraud.data.augment import CropAugmentedDataset
+
+        logger.info(
+            "Crop augmentation enabled: prob=%.2f, span=%d-%d words",
+            cfg.data.augmentation.crop_prob,
+            cfg.data.augmentation.crop_min_words,
+            cfg.data.augmentation.crop_max_words,
+        )
+        train_dataset = CropAugmentedDataset(
+            train_dataset,
+            crop_prob=cfg.data.augmentation.crop_prob,
+            min_words=cfg.data.augmentation.crop_min_words,
+            max_words=cfg.data.augmentation.crop_max_words,
+        )
+
     train_loader = DataLoader(
         train_dataset,
         batch_sampler=train_sampler,
@@ -310,9 +332,14 @@ def _build_centroid_probe(cfg, train_dataset, val_dataset, output_dir):
         other_senders=other_senders,
         synthetic_texts=syn_texts or None,
         synthetic_source_senders=syn_sources or None,
+        n_profile_senders=cfg.probe.n_profile_senders,
+        n_enroll_per_sender=cfg.probe.n_enroll_per_sender,
+        n_query_per_sender=cfg.probe.n_query_per_sender,
+        n_other_queries=cfg.probe.n_other_queries,
+        n_synthetic_queries=cfg.probe.n_synthetic_queries,
         confidence_tiers=cfg.confidence_tiers,
         score_fns=cfg.head.eval_score_fns or None,
-        seed=0,
+        seed=cfg.probe.seed,
     )
 
 

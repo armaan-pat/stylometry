@@ -130,6 +130,10 @@ class Trainer:
 
         # Cache episode_k so the per-batch loop avoids repeated attribute lookups.
         self._episode_k: int | None = getattr(model, "episode_k", None)
+        # Episodic losses need raw sender-id strings to spot __syn hard negatives.
+        self._loss_wants_sender_ids: bool = bool(
+            getattr(loss_fn, "requires_sender_ids", False)
+        )
 
         trainable_params = list(filter(lambda p: p.requires_grad, model.parameters()))
         if not trainable_params:
@@ -325,9 +329,10 @@ class Trainer:
         torch.save(self._build_payload(epoch, val_loss), path)
 
     def _save_best_checkpoint(self, epoch: int, val_loss: float) -> None:
+        # The caller logs the monitored metric; logging val_loss here as
+        # "new best" was misleading whenever monitor != val/loss.
         path = self.output_dir / "checkpoint_best.pt"
         torch.save(self._build_payload(epoch, val_loss), path)
-        logger.info("New best val/loss=%.4f at epoch %d → %s", val_loss, epoch, path)
 
     def _build_payload(self, epoch: int, val_loss: float) -> dict:
         return {
@@ -380,6 +385,28 @@ class Trainer:
     _scheduler_state: dict | None = None
     _resume_scheduler_state: dict | None = None
 
+    def _compute_loss(
+        self,
+        embeddings: torch.Tensor,
+        labels: torch.Tensor,
+        sender_ids: list[str],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Stride labels/sender_ids to episode granularity and apply the loss.
+
+        LUAR episode pooling shrinks P*K rows → P*(K/episode_k); labels (and
+        sender_ids, when the loss wants them) are strided by the same factor
+        to stay aligned with the embedding rows. Returns (loss, batch_labels).
+        """
+        batch_labels = labels[::self._episode_k] if self._episode_k else labels
+        if self._loss_wants_sender_ids:
+            batch_sender_ids = (
+                sender_ids[:: self._episode_k] if self._episode_k else sender_ids
+            )
+            loss = self.loss_fn(embeddings, batch_labels, sender_ids=batch_sender_ids)
+        else:
+            loss = self.loss_fn(embeddings, batch_labels)
+        return loss, batch_labels
+
     def _train_epoch(self, loader: DataLoader, scheduler: Any) -> float:
         """Single training epoch; returns mean loss."""
         self.model.train()
@@ -398,10 +425,7 @@ class Trainer:
             if self.scaler is not None:
                 with torch.amp.autocast(device_type=self.device):
                     embeddings = self.model.encode(**token_dict)
-                    # LUAR episode pooling shrinks P*K rows → P*(K/episode_k);
-                    # stride labels by the same factor to keep shapes aligned.
-                    batch_labels = labels[::self._episode_k] if self._episode_k else labels
-                    loss = self.loss_fn(embeddings, batch_labels)
+                    loss, _ = self._compute_loss(embeddings, labels, batch.sender_ids)
                 self.scaler.scale(loss).backward()
                 # Unscale before clip so the norm is in true fp32 units.
                 self.scaler.unscale_(self.optimizer)
@@ -410,8 +434,7 @@ class Trainer:
                 self.scaler.update()
             else:
                 embeddings = self.model.encode(**token_dict)
-                batch_labels = labels[::self._episode_k] if self._episode_k else labels
-                loss = self.loss_fn(embeddings, batch_labels)
+                loss, _ = self._compute_loss(embeddings, labels, batch.sender_ids)
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
                 self.optimizer.step()
@@ -440,8 +463,9 @@ class Trainer:
                 token_dict = {k: v.to(self.device) for k, v in token_dict.items()}
 
                 embeddings = self.model.encode(**token_dict)
-                batch_labels = labels[::self._episode_k] if self._episode_k else labels
-                loss = self.loss_fn(embeddings, batch_labels)
+                loss, batch_labels = self._compute_loss(
+                    embeddings, labels, batch.sender_ids
+                )
                 total_loss += loss.item()
                 n_batches += 1
 

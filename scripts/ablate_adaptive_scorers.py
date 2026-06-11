@@ -206,10 +206,16 @@ def _paired_bootstrap(
 
 def _score_all(
     encoder, device: str, probe: dict, seed: int, ewma_alpha: float,
+    crop_syn: bool = False,
 ) -> tuple[dict[str, dict[str, np.ndarray]], float]:
     """Encode pools, fit a ProfileBank, return per-scorer pool scores + mean LW-α.
 
     scorer_scores[name] = {"genuine", "other", "synthetic"} arrays of scores.
+    With crop_syn=True an extra "syn_crop" pool is scored: each synthetic
+    impostor cropped to a random 5–60-word span (mirroring train-time crop
+    augmentation). The standard synthetic pool has no emails under 26 words,
+    so without this pool short-query forgery is unmeasured
+    (docs/v9_lineage_results_analysis.md §4).
     """
     enroll_emb = _encode_texts(encoder, probe["enroll_texts"], device)
     gen_emb = _encode_texts(encoder, probe["gen_texts"], device)
@@ -218,6 +224,13 @@ def _score_all(
         _encode_texts(encoder, probe["syn_texts"], device)
         if probe["syn_texts"] else np.empty((0, gen_emb.shape[1]))
     )
+    syn_crop_emb = np.empty((0, gen_emb.shape[1]))
+    if crop_syn and probe["syn_texts"]:
+        import random as _random
+        from email_fraud.data.augment import random_word_crop
+        crng = _random.Random(seed)
+        cropped = [random_word_crop(t, crng, 5, 60) for t in probe["syn_texts"]]
+        syn_crop_emb = _encode_texts(encoder, cropped, device)
 
     bank = ProfileBank(ewma_alpha=ewma_alpha).fit(enroll_emb, probe["enroll_sids"])
     mean_lw_alpha = _mean_lw_shrinkage(bank)
@@ -240,7 +253,38 @@ def _score_all(
                 if len(syn_emb) else np.array([])
             ),
         }
+        if len(syn_crop_emb):
+            # Crops keep the mimicked sender id — claimed senders unchanged.
+            scorer_scores[name]["syn_crop"] = score_pool(
+                bank, syn_crop_emb, syn_claimed, name
+            )
     return scorer_scores, mean_lw_alpha
+
+
+def _operating_point_extras(sc: dict[str, np.ndarray]) -> dict[str, float]:
+    """Deployment-relevant point estimates the rank metrics hide.
+
+    fpr_other_at_{1,5}: other-sender (real human, wrong claimed sender) accept
+    rate when the threshold is anchored at 1%/5% FPR on the synthetic pool —
+    the cost the genuine-vs-synthetic split never shows (the 2026-06-10 v9
+    checkpoint had tpr5=0.837 *and* fpr_other_at_5=0.595).
+    auc_g_other: genuine-vs-other ranking quality.
+    {auc,tpr1,tpr5}_crop: same-tail metrics against cropped (short) synthetics.
+    """
+    out: dict[str, float] = {}
+    gen, oth, syn = sc["genuine"], sc["other"], sc["synthetic"]
+    if len(syn) and len(oth):
+        for fpr, key in [(0.01, "fpr_other_at_1"), (0.05, "fpr_other_at_5")]:
+            thr = np.quantile(syn, 1.0 - fpr, method="higher")
+            out[key] = float((oth >= thr).mean())
+    if len(oth):
+        out["auc_g_other"] = _metric_on(gen, oth, "auc")
+    crop = sc.get("syn_crop")
+    if crop is not None and len(crop):
+        out["auc_crop"] = _metric_on(gen, crop, "auc")
+        out["tpr1_crop"] = _metric_on(gen, crop, "tpr1")
+        out["tpr5_crop"] = _metric_on(gen, crop, "tpr5")
+    return out
 
 
 def _mean_lw_shrinkage(bank: ProfileBank) -> float:
@@ -276,13 +320,21 @@ def parse_args() -> argparse.Namespace:
                    help="Metric to rank/recommend on (tpr1 = TPR@1%%FPR, the conservative held-FPR goal).")
     p.add_argument("--bootstrap", type=int, default=1000, help="Bootstrap replicates (0 disables CIs).")
     p.add_argument("--ewma-alpha", type=float, default=0.1, help="EWMA alpha for the ewma_* scorers.")
+    p.add_argument("--crop-syn", action="store_true",
+                   help="Also score a short-impostor pool: each synthetic email cropped "
+                        "to a random 5-60-word span (the standard pool has no email "
+                        "under 26 words, so short-query forgery is otherwise unmeasured).")
     p.add_argument("--k-sweep", default=None,
                    help="Comma-separated enroll sizes for a point-estimate sweep, e.g. 4,8,16,25.")
-    p.add_argument("--n-profile-senders", type=int, default=30)
+    # Expanded 2026-06-09 to match the bigger CentroidProbe (configs/base.yaml
+    # `probe:`): the old 30×4/200/200 probe gave ±0.13-wide tpr1 CIs — wider
+    # than most candidate-scorer deltas. Builders cap to availability, so these
+    # degrade gracefully on small splits.
+    p.add_argument("--n-profile-senders", type=int, default=60)
     p.add_argument("--n-enroll", type=int, default=8)
-    p.add_argument("--n-query", type=int, default=4)
-    p.add_argument("--n-other", type=int, default=200)
-    p.add_argument("--n-synth", type=int, default=200)
+    p.add_argument("--n-query", type=int, default=6)
+    p.add_argument("--n-other", type=int, default=600)
+    p.add_argument("--n-synth", type=int, default=600)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default=None)
     p.add_argument(
@@ -337,7 +389,10 @@ def main() -> None:
         len(probe["chosen_senders"]), args.n_enroll,
         len(probe["gen_texts"]), len(probe["other_texts"]), len(probe["syn_texts"]),
     )
-    scorer_scores, lw_alpha = _score_all(encoder, device, probe, args.seed, args.ewma_alpha)
+    scorer_scores, lw_alpha = _score_all(
+        encoder, device, probe, args.seed, args.ewma_alpha, crop_syn=args.crop_syn,
+    )
+    extras = {name: _operating_point_extras(scorer_scores[name]) for name in SCORERS}
 
     # Bootstrap every metric on the chosen split.
     boot: dict[str, dict[str, dict[str, float]]] = {}
@@ -355,7 +410,7 @@ def main() -> None:
         reverse=higher_better,
     )
 
-    _print_table(args, boot, ranked, lw_alpha, probe)
+    _print_table(args, boot, ranked, lw_alpha, probe, extras)
     recommendation = _recommend(boot, ranked, rank_metric, BASELINE)
 
     # ---- Optional K-sweep (point estimates only) ----
@@ -387,7 +442,8 @@ def main() -> None:
             k_sweep_rows.append({"scorer": name, **{f"K={k}": vals[k] for k in ks}})
 
     summary = _write_outputs(
-        args, cfg_path, boot, ranked, lw_alpha, probe, recommendation, k_sweep_rows
+        args, cfg_path, boot, ranked, lw_alpha, probe, recommendation, k_sweep_rows,
+        extras,
     )
 
     if args.wandb:
@@ -398,15 +454,18 @@ def main() -> None:
     print("=" * 78)
 
 
-def _print_table(args, boot, ranked, lw_alpha, probe) -> None:
+def _print_table(args, boot, ranked, lw_alpha, probe, extras) -> None:
     print()
     print(f"Adaptive-scorer ablation — split=genuine-vs-{args.split}, "
           f"K_enroll={args.n_enroll}, {len(probe['chosen_senders'])} senders, "
           f"mean LW-α={lw_alpha:.3f}, bootstrap={args.bootstrap}")
     print(f"(baseline = {BASELINE}; Δ columns are vs that baseline on the ranking split)\n")
     rb = args.rank_by
+    has_crop = any("tpr1_crop" in extras[n] for n in ranked)
     hdr = (f"{'scorer':22s} {'AUC':>16s} {'pAUC5':>8s} {'TPR@1%':>8s} "
-           f"{'TPR@5%':>8s} {'1-EER':>7s} {('Δ'+rb+' [95% CI]'):>22s} {'P(win)':>7s}")
+           f"{'TPR@5%':>8s} {'1-EER':>7s} {'FPRoth@5':>9s}"
+           + (f" {'TPR1crop':>9s}" if has_crop else "")
+           + f" {('Δ'+rb+' [95% CI]'):>22s} {'P(win)':>7s}")
     print(hdr)
     print("-" * len(hdr))
     for name in ranked:
@@ -416,15 +475,22 @@ def _print_table(args, boot, ranked, lw_alpha, probe) -> None:
         d = boot[rb][name]
         dci = f"{_signed(d['dlo'])},{_signed(d['dhi'])}"
         star = "" if name == BASELINE else (" *" if (d["dlo"] > 0) else "")
+        ex = extras[name]
+        fpr_oth = ex.get("fpr_other_at_5")
+        crop_col = (f" {ex.get('tpr1_crop', float('nan')):>9.3f}" if has_crop else "")
         print(f"{name:22s} {auc_ci:>16s} "
               f"{boot['pauc5'][name]['point']:>8.3f} "
               f"{boot['tpr1'][name]['point']:>8.3f} "
               f"{boot['tpr5'][name]['point']:>8.3f} "
               f"{1.0 - eer:>7.3f} "
+              f"{(f'{fpr_oth:.3f}' if fpr_oth is not None else 'nan'):>9s}"
+              f"{crop_col} "
               f"{('['+dci+']'):>22s} "
               f"{d['p_win']:>7.2f}{star}")
     print("\n  *  = Δ vs baseline 95% CI excludes 0 on the ranking metric "
           f"({rb}) → significantly better.")
+    print("  FPRoth@5 = other-sender accept rate at the 5% FPR_syn threshold "
+          "(watch for Goodharting — see docs/v9_lineage_results_analysis.md §3).")
 
 
 def _signed(x: float) -> str:
@@ -456,7 +522,7 @@ def _recommend(boot, ranked, rank_metric, baseline) -> dict:
 
 
 def _write_outputs(args, cfg_path, boot, ranked, lw_alpha, probe,
-                   recommendation, k_sweep_rows) -> None:
+                   recommendation, k_sweep_rows, extras) -> None:
     out_dir = _PROJECT_ROOT / args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     rows = []
@@ -470,6 +536,7 @@ def _write_outputs(args, cfg_path, boot, ranked, lw_alpha, probe,
             row[f"{mkey}_dlo"] = b["dlo"]
             row[f"{mkey}_dhi"] = b["dhi"]
             row[f"{mkey}_pwin"] = b["p_win"]
+        row.update(extras[name])  # fpr_other_at_*, auc_g_other, *_crop
         rows.append(row)
 
     summary = {
@@ -497,9 +564,12 @@ def _write_outputs(args, cfg_path, boot, ranked, lw_alpha, probe,
         json.dump(summary, fh, indent=2)
     logger.info("Saved JSON → %s", json_path)
 
+    _EXTRA_KEYS = ("fpr_other_at_1", "fpr_other_at_5", "auc_g_other",
+                   "auc_crop", "tpr1_crop", "tpr5_crop")
     csv_keys = (["scorer", "is_baseline"]
                 + [f"{m}{suf}" for m in _METRICS
-                   for suf in ("", "_lo", "_hi", "_dlo", "_dhi", "_pwin")])
+                   for suf in ("", "_lo", "_hi", "_dlo", "_dhi", "_pwin")]
+                + [k for k in _EXTRA_KEYS if any(k in r for r in rows)])
     csv_path = out_dir / f"{args.tag}.csv"
     with csv_path.open("w") as fh:
         fh.write(",".join(csv_keys) + "\n")

@@ -1,0 +1,106 @@
+# V10 — the AUTHORSHIP specialist: v9's recipe, selected for human-impostor
+# discrimination instead of synthetic separation.
+#
+# The 2026-06-10 lineage run (docs/v9_lineage_results_analysis.md §3) showed
+# the v9 episodic recipe produces two different specialists during ONE run:
+#
+#   - genuine-vs-SYNTHETIC separation matures by epoch ~10, then slowly decays
+#     as the representation reallocates toward sender-vs-sender contrast;
+#   - genuine-vs-OTHER (real human impostor) discrimination starts weak
+#     (AUC 0.70 at ep10) and matures late (0.937 by ep150 — the best
+#     authorship verifier measured in this project).
+#
+# The old `pauc/genuine_vs_synthetic_5pct` monitor therefore freezes the
+# LLM-detector specialist (v9's role); this config is byte-identical to
+# v9_episodic_shortmail.yaml EXCEPT it monitors `pauc/genuine_vs_other_5pct`,
+# freezing the authorship specialist instead. Deploy as a pair: v10 answers
+# "is this the claimed human?", v9 answers "is this LLM-written mimicry?"
+# (fusion: scripts/eval_two_model_fusion.py).
+
+encoder:
+  model_name_or_path: rrivera1849/LUAR-MUD
+  pooling: luar_episode
+  freeze_backbone: false
+  lora:
+    r: 16
+    alpha: 32
+    target_modules:
+      - query
+      - value
+      - key
+    dropout: 0.05
+  max_length: 512
+  projection_dim: 128
+  episode_k: 1
+  trust_remote_code: true
+
+loss:
+  name: episodic
+  temperature: 0.05
+  support_k_min: 2
+  support_k_max: 6
+  supcon_weight: 0.5
+
+head:
+  name: prototypical
+  score_fn: adaptive_k
+  eval_score_fns:
+    - linear_z3
+    - cosine
+    - sigmoid_z
+    - z_persender_sigmoid
+
+data:
+  processed_dir: data/processed/enron_shortmail
+  train_senders: 100
+  emails_per_sender_k: 8
+  val_split: 0.1
+  test_split: 0.1
+  preprocessing:
+    strip_signatures: false
+    min_body_chars: 20
+    min_body_words: 5
+  augmentation:
+    synthetic_path: data/synthetic/enron_synthetic_v2
+    n_syn_per_batch: 4
+    crop_prob: 0.3
+    crop_min_words: 5
+    crop_max_words: 60
+
+training:
+  epochs: 150
+  batch_size: 128
+  lr: 2.0e-4
+  scheduler: cosine
+  warmup_steps: 200
+  grad_clip: 1.0
+  mixed_precision: true
+  # THE one change vs v9: select the checkpoint where real-human-impostor
+  # rejection peaks. Requires the pauc/genuine_vs_other_5pct probe metric
+  # (src/email_fraud/scoring/centroid_probe.py, added 2026-06-11).
+  monitor: pauc/genuine_vs_other_5pct
+  monitor_mode: max
+  early_stopping_patience: 0
+  early_stopping_min_delta: 1.0e-3
+  keep_last_n: 1
+  hard_negative_mining:
+    enabled: true
+    warmup_epochs: 20
+    ramp_epochs: 30
+    interval: 5
+    n_pairs: 20
+    max_hard_fraction: 0.5
+
+wandb:
+  name: v10-episodic-authorship
+  tags:
+    - luar
+    - lora
+    - episodic
+    - variable-k
+    - crop-augment
+    - short-email
+    - v10
+    - syn-v2
+    - authorship-monitor
+  notes: "V10: v9 recipe selected on pauc/genuine_vs_other_5pct — the authorship specialist of the v9/v10 two-model pair."

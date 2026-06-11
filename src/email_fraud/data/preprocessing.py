@@ -197,17 +197,22 @@ def _normalize_high_variance(text: str) -> str:
     return text
 
 
-def _is_usable(body: str, min_chars: int) -> bool:
-    """Return True if the body meets length and placeholder-ratio thresholds.
+def _is_usable(body: str, config: PreprocessingConfig) -> bool:
+    """Return True if the body meets length, word, alnum, and placeholder thresholds.
 
+    Enforces min_body_chars, min_body_words, and min_alnum_ratio (the latter
+    two were declared in PreprocessingConfig but unenforced before 2026-06-09).
     If >50% of tokens are placeholders after entity masking, the email's
     content has been mostly stripped and is no longer useful for stylometry.
     """
     stripped = body.strip()
-    if len(stripped) < min_chars:
+    if len(stripped) < config.min_body_chars:
         return False
     words = stripped.split()
-    if not words:
+    if len(words) < config.min_body_words or not words:
+        return False
+    alnum = sum(1 for c in stripped if c.isalnum() or c.isspace())
+    if alnum / len(stripped) < config.min_alnum_ratio:
         return False
     token_ratio = len(_RE_PLACEHOLDER.findall(stripped)) / len(words)
     return token_ratio < 0.5
@@ -251,7 +256,7 @@ def preprocess(text: str, config: PreprocessingConfig) -> Optional[str]:
     if config.max_body_chars and len(text) > config.max_body_chars:
         text = text[:config.max_body_chars]
 
-    if not _is_usable(text, config.min_body_chars):
+    if not _is_usable(text, config):
         return None
 
     return text
