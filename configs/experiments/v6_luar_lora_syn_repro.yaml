@@ -1,0 +1,89 @@
+# V6 reproduction — faithful rerun of the performant v6 run, in THIS repo.
+#
+# Reproduces runs/v6_luar_lora_syn/2026-06-02_06-04-02 from the *dan* checkout
+# (the run that beat every v11 arm on pooled tpr@1%fpr). The point is a clean,
+# apples-to-apples comparison: same code path and same eval harness as the v11
+# arms — in particular the new genuine_vs_other operating points
+# (tpr_at_fpr/other_*, op/other/*) added to centroid_probe.py — so v6's
+# wrong-sender tail is reported on exactly the same axes as v11.
+#
+# IMPORTANT — this mirrors the RUN SNAPSHOT (the run dir's config.yaml), NOT the
+# since-edited configs/experiments/v6_luar_lora_syn.yaml in the dan repo. The
+# source file was edited after the run (train_senders 125->100, test_split
+# 0.2->0.1, hard-neg mining turned ON, n_syn 2->...); the actual performant run
+# used the values below. Faithful repro = those values:
+#   - train_senders: 125          (NOT 100)
+#   - test_split: 0.2             (NOT 0.1)
+#   - hard_negative_mining: OFF   (default; the run had no mining block)
+#   - n_syn_per_batch: 2
+#   - loss: supcon, temperature 0.07
+#   - episode_k: 4, batch 64, lr 2e-4, 100 epochs
+#   - LoRA target_modules: query, value  (NO key)
+#   - processed_dir: data/processed/enron (full-length corpus, the v6 default)
+#   - monitor: default val/loss (min) — the run selected best on val/loss
+#
+# Confound note: v6 trained on 125 senders / test_split 0.2 / full enron, while
+# the v11 arms use 100 / 0.1 / enron_shortmail. This config reproduces v6 as-run
+# (to confirm the headline numbers), so it is NOT confound-free vs v11. For a
+# confound-free A/B, the episode_k knob is isolated cleanly in
+# v11_synv1_lora_k4.yaml instead; this file answers "is v6 really that good when
+# scored by our current harness?".
+
+encoder:
+  model_name_or_path: rrivera1849/LUAR-MUD
+  pooling: luar_episode
+  freeze_backbone: false
+  lora:
+    r: 16
+    alpha: 32
+    target_modules:
+      - query
+      - value
+    dropout: 0.05
+  max_length: 512
+  projection_dim: 128
+  episode_k: 4
+  trust_remote_code: true
+
+loss:
+  name: supcon
+  temperature: 0.07
+
+data:
+  processed_dir: data/processed/enron      # full-length corpus (v6 default), NOT enron_shortmail
+  train_senders: 125
+  emails_per_sender_k: 8
+  val_split: 0.1
+  test_split: 0.2
+  augmentation:
+    synthetic_path: data/synthetic/enron_synthetic
+    n_syn_per_batch: 2
+    # No crop, no register stratification — v6 had neither.
+
+training:
+  epochs: 100
+  batch_size: 64
+  lr: 2.0e-4
+  scheduler: cosine
+  warmup_steps: 200
+  grad_clip: 1.0
+  mixed_precision: true
+  # monitor omitted -> defaults to val/loss (min), exactly as the v6 run selected best.
+  early_stopping_patience: 0
+  early_stopping_min_delta: 1.0e-4
+  keep_last_n: 1
+  # hard_negative_mining omitted -> disabled, matching the run snapshot.
+
+wandb:
+  name: v6-luar-lora-syn-repro
+  tags:
+    - luar
+    - lora
+    - projection
+    - supcon
+    - episode-pooling
+    - episode-k4
+    - synthetic-hard-negatives
+    - v6-repro
+    - v6-vs-v11
+  notes: "Faithful rerun of v6_luar_lora_syn/2026-06-02_06-04-02 (run snapshot: 125 senders, test_split 0.2, n_syn=2, no hard-neg mining, supcon T=0.07, episode_k=4) in the current repo + current eval harness, so genuine_vs_other operating points are reported on the same axes as the v11 arms."

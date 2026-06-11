@@ -40,12 +40,15 @@ _WANDB_KEEP: frozenset[str] = frozenset({
     # pAUC in the low-FPR region (SLA = operate below 5% FPR)
     "pauc/genuine_vs_synthetic_5pct", "pauc/genuine_vs_other_5pct",
     "pauc/min_other_synthetic_5pct",  # composite anti-Goodhart monitor
-    # TPR at tight FPR anchors
-    "tpr_at_fpr/synthetic_1pct", "tpr_at_fpr/all_1pct",
+    # TPR at tight FPR anchors (other_1pct = wrong-sender tail, the one that
+    # sets the pooled all_1pct point for the v11 family — keep it visible)
+    "tpr_at_fpr/synthetic_1pct", "tpr_at_fpr/all_1pct", "tpr_at_fpr/other_1pct",
     # FPR-anchored operating point at 1% (tightest SLA target)
     "op/all/fpr_0.01/recall", "op/all/fpr_0.01/precision", "op/all/fpr_0.01/threshold",
     "op/synthetic/fpr_0.01/recall", "op/synthetic/fpr_0.01/precision",
     "op/synthetic/fpr_0.01/threshold",
+    "op/other/fpr_0.01/recall", "op/other/fpr_0.01/precision",
+    "op/other/fpr_0.01/threshold",
     # Score geometry (gaps only; raw means are less informative)
     "score/gap_other", "score/gap_synthetic", "score/synthetic_harder_than_other",
     # High-confidence threshold band (0.95 is the deployment operating region)
@@ -58,11 +61,13 @@ _WANDB_KEEP: frozenset[str] = frozenset({
     # (kept alongside the 1% SLA anchor for trend comparison, not operational targets)
     "pauc/genuine_vs_synthetic_10pct",
     "pauc/genuine_vs_all_5pct", "pauc/genuine_vs_all_10pct",
-    "tpr_at_fpr/synthetic_5pct", "tpr_at_fpr/all_5pct",
+    "tpr_at_fpr/synthetic_5pct", "tpr_at_fpr/all_5pct", "tpr_at_fpr/other_5pct",
     "op/all/fpr_0.05/recall", "op/all/fpr_0.05/precision", "op/all/fpr_0.05/threshold",
     "op/all/fpr_0.10/recall", "op/all/fpr_0.10/precision", "op/all/fpr_0.10/threshold",
     "op/synthetic/fpr_0.05/recall", "op/synthetic/fpr_0.05/precision", "op/synthetic/fpr_0.05/threshold",
     "op/synthetic/fpr_0.10/recall", "op/synthetic/fpr_0.10/precision", "op/synthetic/fpr_0.10/threshold",
+    "op/other/fpr_0.05/recall", "op/other/fpr_0.05/precision", "op/other/fpr_0.05/threshold",
+    "op/other/fpr_0.10/recall", "op/other/fpr_0.10/precision", "op/other/fpr_0.10/threshold",
 })
 
 
@@ -106,6 +111,12 @@ def _format_epoch_summary(
             f"          gaps   other={_fmt(centroid_metrics, 'score/gap_other', '{:+.3f}')}"
             f"  syn={_fmt(centroid_metrics, 'score/gap_synthetic', '{:+.3f}')}"
             f"  harder={_fmt(centroid_metrics, 'score/synthetic_harder_than_other', '{:+.3f}')}"
+        )
+        lines.append(
+            " " * len(header) + "  "
+            f"tpr@1%fpr      other={_fmt(centroid_metrics, 'tpr_at_fpr/other_1pct')}"
+            f"  syn={_fmt(centroid_metrics, 'tpr_at_fpr/synthetic_1pct')}"
+            f"  all={_fmt(centroid_metrics, 'tpr_at_fpr/all_1pct')}"
         )
         lines.append(
             " " * len(header) + "  "
@@ -172,6 +183,9 @@ class Trainer:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self.model.to(self.device)
+        # Losses with learnable parameters (e.g. llm_detector's classification
+        # head) must live on the same device as the embeddings they consume.
+        self.loss_fn.to(self.device)
 
         # Cache episode_k so the per-batch loop avoids repeated attribute lookups.
         self._episode_k: int | None = getattr(model, "episode_k", None)
@@ -186,7 +200,13 @@ class Trainer:
                 "No trainable parameters found in the encoder. "
                 "Set freeze_backbone=False, add a LoRA config, or set projection_dim."
             )
-        self.optimizer = torch.optim.AdamW(trainable_params, lr=config.lr)
+        # Some losses carry learnable parameters (e.g. the llm_detector loss owns
+        # a classification head) — BaseLoss is an nn.Module precisely so these can
+        # be optimized. Fold them into the same AdamW group as the encoder.
+        loss_params = list(filter(lambda p: p.requires_grad, loss_fn.parameters()))
+        if loss_params:
+            logger.info("Optimizing %d extra parameter tensors from the loss.", len(loss_params))
+        self.optimizer = torch.optim.AdamW(trainable_params + loss_params, lr=config.lr)
 
         self.scaler: torch.amp.GradScaler | None = (
             torch.amp.GradScaler()
@@ -387,6 +407,10 @@ class Trainer:
             "monitor_mode": self._monitor_mode,
             "best_monitor": self._best_monitor,
             "model_state_dict": self.model.state_dict(),
+            # Losses may own learnable params (llm_detector's classification
+            # head); persist them so the trained detector head survives reloads.
+            # Empty dict for paramless losses — harmless.
+            "loss_state_dict": self.loss_fn.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self._scheduler_state,
             "scaler_state_dict": self.scaler.state_dict() if self.scaler else None,
@@ -398,6 +422,9 @@ class Trainer:
         logger.info("Resuming from checkpoint: %s", path)
         payload = torch.load(path, map_location=self.device)
         self.model.load_state_dict(payload["model_state_dict"])
+        # Restore loss-owned params (e.g. llm_detector head) when present.
+        if payload.get("loss_state_dict"):
+            self.loss_fn.load_state_dict(payload["loss_state_dict"])
         self.optimizer.load_state_dict(payload["optimizer_state_dict"])
         if payload.get("scaler_state_dict") and self.scaler is not None:
             self.scaler.load_state_dict(payload["scaler_state_dict"])

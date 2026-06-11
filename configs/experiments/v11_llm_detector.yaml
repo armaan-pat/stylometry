@@ -1,0 +1,114 @@
+# V11 (detector arm) — the BEST LLM-detector, not an authorship model.
+#
+# Same V11 base (V9 recipe: LUAR+LoRA, episode_k=1, batch 128, enron_shortmail +
+# enron_synthetic_v1 hard-neg-only, crop aug) but the objective is swapped from
+# metric learning to DIRECT discrimination:
+#
+#   loss: llm_detector  (src/email_fraud/losses/llm_detector.py)
+#     A linear classification head nn.Linear(128, 1) on the pooled embedding,
+#     trained with BCEWithLogitsLoss to predict human(0) vs LLM-generated(1).
+#     The label is read straight off the "__syn" suffix every synthetic hard
+#     negative already carries; per-batch pos_weight = n_neg/n_pos handles the
+#     synthetic-minority imbalance (n_syn=4 of P=16).
+#
+# Why this and not the episodic loss: docs/v10_two_model_memo.md §2 shows
+# "LLM-ness" is an easy, GLOBAL axis (a frozen linear probe separates Mistral
+# text ~100%), which the metric losses only pick up incidentally — and which
+# peaks early then DECAYS as capacity reallocates to per-sender authorship
+# (v9 genuine-vs-syn AUC peaks ep10, decays to ep150). A BCE classification head
+# optimizes that axis directly and monotonically, contrasts ALL synthetics vs
+# ALL humans per batch, and is sender-agnostic (no enrolled centroid needed).
+#
+# A 0.3 SupCon aux is kept so the embedding still clusters per-sender enough for
+# centroid enrollment, keeping the genuine_vs_synthetic CentroidProbe and the
+# pauc/genuine_vs_synthetic_5pct monitor meaningful and lineage-comparable.
+#
+# Expectation: strong genuine-vs-synthetic AUC/TPR@1%; WEAK genuine-vs-other /
+# high FPR_other — by design, it is the detector half of the two-model design
+# (docs/v10_two_model_memo.md), not an authorship verifier.
+
+encoder:
+  model_name_or_path: rrivera1849/LUAR-MUD
+  pooling: luar_episode
+  freeze_backbone: false
+  lora:
+    r: 16
+    alpha: 32
+    target_modules:
+      - query
+      - value
+      - key
+    dropout: 0.05
+  max_length: 512
+  projection_dim: 128
+  episode_k: 1
+  trust_remote_code: true
+
+loss:
+  name: llm_detector
+  temperature: 0.05
+  supcon_weight: 0.3
+
+head:
+  name: prototypical
+  score_fn: adaptive_k
+  eval_score_fns:
+    - linear_z3
+    - cosine
+    - sigmoid_z
+    - z_persender_sigmoid
+
+data:
+  processed_dir: data/processed/enron_shortmail
+  train_senders: 100
+  emails_per_sender_k: 8
+  val_split: 0.1
+  test_split: 0.1
+  preprocessing:
+    strip_signatures: false
+    min_body_chars: 20
+    min_body_words: 5
+  augmentation:
+    synthetic_path: data/synthetic/enron_synthetic_v1
+    n_syn_per_batch: 4
+    crop_prob: 0.3          # length invariance: short real positives via crops
+    crop_min_words: 5
+    crop_max_words: 60
+    # Register invariance from REAL text (LLM-free) — keeps the SupCon-aux
+    # embedding sender-clustered across registers; post-merge canonical recipe.
+    register_stratified: true
+
+training:
+  epochs: 150
+  batch_size: 128
+  lr: 2.0e-4
+  scheduler: cosine
+  warmup_steps: 200
+  grad_clip: 1.0
+  mixed_precision: true
+  monitor: pauc/genuine_vs_synthetic_5pct
+  monitor_mode: max
+  early_stopping_patience: 0
+  early_stopping_min_delta: 1.0e-3
+  keep_last_n: 1
+  hard_negative_mining:
+    enabled: true
+    warmup_epochs: 20
+    ramp_epochs: 30
+    interval: 5
+    n_pairs: 20
+    max_hard_fraction: 0.5
+
+wandb:
+  name: v11-llm-detector
+  tags:
+    - luar
+    - lora
+    - llm-detector
+    - bce
+    - classification-head
+    - crop-augment
+    - short-email
+    - v11
+    - syn-v1
+  notes: "V11 detector: BCE classification head (human vs LLM) on the V9 recipe, syn-v1. Direct LLM-detection objective, not authorship. Detector half of the two-model design."

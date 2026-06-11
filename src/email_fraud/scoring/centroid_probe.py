@@ -368,6 +368,14 @@ def _metrics_for_score_set(
         labels = np.concatenate([np.ones_like(genuine), np.zeros_like(other)])
         scores = np.concatenate([genuine, other])
         out[f"{prefix}pauc/genuine_vs_other_5pct"] = compute_pauc(labels, scores, max_fpr=0.05)
+        # Wrong-sender operating points. The pooled all_1pct point is set by the
+        # hardest negative tail; for the v11-family runs that tail is the
+        # other-sender impostors, not synthetics (synthetic_harder_than_other < 0).
+        # Logging the other-only TPR@FPR makes that authorship tail visible
+        # directly rather than only through the AUC, so v6↔v11 comparisons aren't
+        # masked by near-perfect genuine_vs_synthetic.
+        out[f"{prefix}tpr_at_fpr/other_1pct"] = compute_tpr_at_fpr(labels, scores, target_fpr=0.01)
+        out[f"{prefix}tpr_at_fpr/other_5pct"] = compute_tpr_at_fpr(labels, scores, target_fpr=0.05)
 
     # Anti-Goodhart composite: the worse of the two impostor tails. The
     # 2026-06-10 lineage run showed that monitoring the synthetic tail alone
@@ -530,6 +538,8 @@ def _fpr_anchored_thresholds(
     _report("op/all", impostors)
     if len(synthetic):
         _report("op/synthetic", synthetic)
+    if len(other):
+        _report("op/other", other)
     return out
 
 

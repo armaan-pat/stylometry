@@ -184,6 +184,9 @@ def _run_training(cfg, EncoderClass, LossClass, HeadClass, args, output_dir: Pat
                 "support_k_min": cfg.loss.support_k_min,
                 "support_k_max": cfg.loss.support_k_max,
                 "supcon_weight": cfg.loss.supcon_weight,
+                # Width of the embedding the loss may build a head on (llm_detector).
+                # Other losses don't accept it and are filtered out below.
+                "embedding_dim": cfg.encoder.projection_dim,
             }.items()
             if k in LossClass.__init__.__code__.co_varnames
         }
@@ -222,11 +225,14 @@ def _run_training(cfg, EncoderClass, LossClass, HeadClass, args, output_dir: Pat
             cfg.data.augmentation.synthetic_path,
             n_syn,
         )
-        # llm_negatives_only=True (the default) drops any synthetic row stored
-        # under a real sender_id — LLM text is only ever a hard negative, never a
-        # positive — regardless of how the on-disk dataset was generated.
+        # llm_negatives_only=True drops any synthetic row stored under a real
+        # sender_id — LLM text is ONLY EVER a hard negative, never a positive —
+        # regardless of how the on-disk dataset was generated. Set explicitly
+        # (not just relying on the default) because this is a hard project
+        # invariant: no LLM example may be a positive in any run.
         train_dataset = SyntheticAugmentedDataset(
-            train_dataset, cfg.data.augmentation.synthetic_path
+            train_dataset, cfg.data.augmentation.synthetic_path,
+            llm_negatives_only=True,
         )
         register_labels = _maybe_register_labels(cfg, train_dataset)
         train_sampler = SyntheticBalancedSampler(

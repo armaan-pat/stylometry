@@ -1,0 +1,131 @@
+# V11 (LoRA, episode_k=4) — the authorship-recovery ablation.
+#
+# Companion to v11_synv1_lora.yaml. The v6↔v11 comparison
+# (docs/v6_vs_v11_memo / wandb) showed v6_luar_lora_syn beats every v11 arm on
+# the pooled tpr@1%fpr (0.808 vs 0.742 for the best v11 arm, `lora`) NOT because
+# it detects synthetics better — every v11 arm matches or beats v6 on
+# genuine_vs_synthetic — but because its wrong-sender (genuine_vs_other)
+# discrimination is stronger (auc 0.969 vs 0.934). At a 1% FPR the threshold is
+# pinned by the hardest negative tail, which for the v11 family is the
+# other-sender impostors (score/synthetic_harder_than_other < 0), so the pooled
+# tpr@1% tracks genuine_vs_other almost directly.
+#
+# Holding the loss fixed does NOT recover v6: the supcon arm at episode_k=1
+# (v11_synv1_lora_supcon) lands at vs_other ~0.927, same neighbourhood as the
+# episodic arm's 0.934. That isolates v6's authorship edge to the two knobs the
+# loss can't explain — episode_k=4 training and (secondarily) the absence of
+# crop augmentation.
+#
+# This arm changes EXACTLY ONE modelling knob vs v11_synv1_lora:
+#     episode_k:  1  ->  4
+# Training now pools 4-email episodes (as v6 did), giving the contrastive loss a
+# denoised per-author signal so the backbone+LoRA learn cleaner author geometry;
+# the CentroidProbe still scores single emails (episode_k is forced to 1 during
+# eval — centroid_probe.py:_encode), so enrollment/inference semantics are
+# unchanged and the metrics stay directly comparable to every other v11 arm.
+# Per-sender episode structure matches v6: P=16 senders x 8 emails = 2
+# episodes/sender (v6: P=8 x 8 = 2 episodes/sender).
+#
+# Two deliberate departures from a strict single-knob clone, both documented:
+#   - monitor -> pauc/min_other_synthetic_5pct (the anti-Goodhart composite):
+#     selecting checkpoint_best on the synthetic tail alone picks early
+#     checkpoints that leak wrong-sender mail (lineage 2026-06-10; v9@ep10
+#     accepted 59.5% of wrong-sender mail). min() can only be gamed by being
+#     good at BOTH tails — which is the whole point of this arm. Training is
+#     unchanged (early_stopping_patience=0), so this only affects which epoch is
+#     saved as best, not the run itself.
+# Crop augmentation is left ON here so episode_k is the sole modelling change;
+# crop_prob=0.0 is the natural follow-up ablation if k=4 alone doesn't close the
+# gap to v6.
+
+encoder:
+  model_name_or_path: rrivera1849/LUAR-MUD
+  pooling: luar_episode
+  freeze_backbone: false
+  lora:
+    r: 16
+    alpha: 32
+    target_modules:
+      - query
+      - value
+      - key
+    dropout: 0.05
+  max_length: 512
+  projection_dim: 128
+  episode_k: 4          # <-- the only modelling change vs v11_synv1_lora (was 1)
+  trust_remote_code: true
+
+loss:
+  name: episodic
+  temperature: 0.05
+  support_k_min: 2
+  support_k_max: 6
+  supcon_weight: 0.5
+
+head:
+  name: prototypical
+  score_fn: adaptive_k
+  eval_score_fns:
+    - linear_z3
+    - cosine
+    - sigmoid_z
+    - z_persender_sigmoid
+
+data:
+  processed_dir: data/processed/enron_shortmail
+  train_senders: 100
+  emails_per_sender_k: 8
+  val_split: 0.1
+  test_split: 0.1
+  preprocessing:
+    strip_signatures: false
+    min_body_chars: 20
+    min_body_words: 5
+  augmentation:
+    synthetic_path: data/synthetic/enron_synthetic_v1
+    n_syn_per_batch: 4
+    crop_prob: 0.3          # length invariance: short real positives via crops
+    crop_min_words: 5
+    crop_max_words: 60
+    # Register invariance from REAL text (the LLM-free replacement for v8's
+    # cross-register LLM positives): each sender's K in-batch emails are picked
+    # to span as many of their registers (formal/casual/terse) as possible, so
+    # every episode carries genuine same-author cross-register positives.
+    register_stratified: true
+
+training:
+  epochs: 150
+  batch_size: 128
+  lr: 2.0e-4
+  scheduler: cosine
+  warmup_steps: 200
+  grad_clip: 1.0
+  mixed_precision: true
+  monitor: pauc/min_other_synthetic_5pct   # anti-Goodhart: rewards BOTH tails (was genuine_vs_synthetic_5pct)
+  monitor_mode: max
+  early_stopping_patience: 0
+  early_stopping_min_delta: 1.0e-3
+  keep_last_n: 1
+  hard_negative_mining:
+    enabled: true
+    warmup_epochs: 20
+    ramp_epochs: 30
+    interval: 5
+    n_pairs: 20
+    max_hard_fraction: 0.5
+
+wandb:
+  name: v11-synv1-lora-k4
+  tags:
+    - luar
+    - lora
+    - episodic
+    - variable-k
+    - episode-k4
+    - crop-augment
+    - short-email
+    - v11
+    - syn-v1
+    - no-cross-register
+    - authorship-recovery
+  notes: "V11 LoRA episode_k=4: single-knob ablation vs v11_synv1_lora (episode_k 1->4) to recover v6's wrong-sender (genuine_vs_other) discrimination that sets the pooled tpr@1%fpr. Monitor switched to min_other_synthetic (anti-Goodhart). Eval still single-email (k forced to 1 in probe)."
