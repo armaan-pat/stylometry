@@ -1,7 +1,7 @@
 # V11 (LoRA, episode_k=4) — the authorship-recovery ablation.
 #
 # Companion to v11_synv1_lora.yaml. The v6↔v11 comparison
-# (docs/v6_vs_v11_memo / wandb) showed v6_luar_lora_syn beats every v11 arm on
+# Wandb comparison showed v6_luar_lora_syn beats every v11 arm on
 # the pooled tpr@1%fpr (0.808 vs 0.742 for the best v11 arm, `lora`) NOT because
 # it detects synthetics better — every v11 arm matches or beats v6 on
 # genuine_vs_synthetic — but because its wrong-sender (genuine_vs_other)

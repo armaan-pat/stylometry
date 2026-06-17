@@ -37,7 +37,7 @@ Calibrated variants (CALIBRATED_SCORE_FNS)
 These take a third argument: the sender's data-driven z scale (the shrunk p90
 of the sender's leave-one-out genuine z distribution, computed by
 PrototypicalHead at fit time). They fix the two failure modes of the fixed-/3
-family documented in docs/scoring_ablation_results.md: score reachability
+family — score reachability
 (only ~6% of genuine emails clear 0.8 under linear_z3) and cross-sender
 threshold transfer (a global τ means something different per sender).
 
@@ -80,7 +80,7 @@ def neg_z(cos_sim: float, spread: float) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Per-sender calibration (see docs/scoring_ablation_results.md)
+# Per-sender calibration
 # ---------------------------------------------------------------------------
 
 # Which genuine LOO-z quantile the per-sender scale anchors on, and the

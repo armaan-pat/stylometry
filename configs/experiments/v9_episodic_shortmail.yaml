@@ -1,6 +1,6 @@
 # V9 — episodic variable-K training + short-email fixes (one shared retrain).
 #
-# Implements items 1+2 of the attack order in docs/robustness_mechanisms.md:
+# Two changes over the V8 recipe:
 #   A1  Episodic, K-matched training: loss "episodic" splits each sender's
 #       in-batch embeddings into a support set of K' ~ uniform{2..6} and a
 #       query set, builds prototypes from support means, and cross-entropies

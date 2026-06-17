@@ -130,10 +130,7 @@ class PrototypicalHead(BaseHead):
         all emails seen so far, regardless of batch size:
             centroid_new = (centroid_old * k_old + sum(batch_embs)) / k_new
         """
-        # Detach and move to CPU — profiles are CPU tensors; embedding
-        # computation happens on GPU but profile arithmetic is lightweight.
-        embeddings = embeddings.detach().cpu()
-        # dict.fromkeys preserves first-appearance order while deduplicating.
+        embeddings = embeddings.detach().cpu()  # profiles live on CPU
         unique_senders = list(dict.fromkeys(sender_ids))
 
         for sid in unique_senders:
@@ -142,10 +139,7 @@ class PrototypicalHead(BaseHead):
             embs = embeddings[idx]  # (k, d)
 
             if sid not in self._profiles:
-                # First time seeing this sender: initialise from batch mean.
                 centroid = embs.mean(dim=0)
-                # Spread = mean cosine distance from individual emails to centroid.
-                # cosine_similarity returns values in [-1, 1]; 1 - sim gives distance in [0, 2].
                 sims = F.cosine_similarity(embs, centroid.unsqueeze(0))
                 spread = float((1.0 - sims).mean())
                 self._profiles[sid] = {
@@ -162,17 +156,13 @@ class PrototypicalHead(BaseHead):
                     self._profiles[sid]["_loo_dirty"] = True
                     self._cal_dirty = True
             else:
-                # Incremental update: merge new batch with existing profile.
                 prof = self._profiles[sid]
                 old_k = prof["k"]
                 new_k = old_k + len(idx)
-                # Weighted average: old centroid represents old_k emails;
-                # new batch contributes len(idx) emails.
                 prof["centroid"] = (
                     prof["centroid"] * old_k + embs.sum(dim=0)
                 ) / new_k
-                # Recompute spread only from the incoming batch against the updated
-                # centroid (not a full recomputation — approximation is acceptable).
+                # Spread approximated from the incoming batch only (not a full recomputation).
                 all_embs = embs
                 sims = F.cosine_similarity(
                     all_embs, prof["centroid"].unsqueeze(0)

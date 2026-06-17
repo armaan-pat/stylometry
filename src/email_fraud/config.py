@@ -82,10 +82,6 @@ class PreprocessingConfig(BaseModel):
     strip_boilerplate: bool = True
     entity_masking: bool = False
     fix_encoding: bool = True          # run ftfy to fix garbled unicode/encoding artifacts
-    # Floors lowered 2026-06-09 (docs/robustness_mechanisms.md §B1): production
-    # must score short emails, so training data should contain them — keep only
-    # a sanity floor. min_body_words/min_alnum_ratio were previously declared
-    # but never enforced; preprocessing._is_usable now checks all three.
     min_body_chars: int = 20           # drop emails shorter than this after cleaning
     min_body_words: int = 5            # drop emails with fewer than this many whitespace-split tokens
     min_alnum_ratio: float = 0.60      # drop emails where <60% of chars are alphanumeric or space
@@ -98,21 +94,13 @@ class AugmentationConfig(BaseModel):
 
     synthetic_path: str | None = None
     n_syn_per_batch: int = 2
-    # Crop augmentation (train-time, text-level): with probability crop_prob a
-    # training email is replaced by a random contiguous span of itself (same
-    # label), forcing length-invariant style features — the cheapest training
-    # change targeted at the short-email FP mode (docs/robustness_mechanisms.md
-    # §B1). 0.0 disables.
+    # Replace each training email with a random word-span with this probability;
+    # forces length-invariant style features. 0.0 disables.
     crop_prob: float = 0.0
     crop_min_words: int = 5
     crop_max_words: int = 60
-
-    # Register-stratified episode sampling: when True, each sender's K in-batch
-    # emails are picked to cover as many registers (formal/casual/terse) as the
-    # sender wrote in, so every episode contains genuine cross-register
-    # same-author positives. This is the LLM-free replacement for the deprecated
-    # cross_register LLM positives — it teaches register invariance from real
-    # text instead of from forgeries stored under a real sender_id.
+    # Pick K in-batch emails per sender to span as many registers as possible,
+    # giving genuine cross-register same-author positives without LLM data.
     register_stratified: bool = False
 
 
@@ -174,14 +162,7 @@ class TrainingConfig(BaseModel):
 
 
 class ProbeConfig(BaseModel):
-    """CentroidProbe sizing — the inference-style validation set.
-
-    Defaults expanded 2026-06-09: the old 30×4=120 genuine / 200 impostor
-    probe had an AUROC σ of ~0.02 and ±0.13-wide bootstrap CIs on TPR@1%,
-    which is larger than most candidate improvements. Roughly 3× more queries
-    halves the noise floor. Cost: ~2.5× more texts to encode per validation
-    pass (still a small fraction of epoch time).
-    """
+    """CentroidProbe sizing — the inference-style validation set."""
     model_config = ConfigDict(extra="forbid")
 
     n_profile_senders: int = 60

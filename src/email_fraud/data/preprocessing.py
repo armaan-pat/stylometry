@@ -10,7 +10,6 @@ from __future__ import annotations
 import email as _email_stdlib
 import email.message
 import re
-from typing import Optional
 
 from email_fraud.config import PreprocessingConfig
 

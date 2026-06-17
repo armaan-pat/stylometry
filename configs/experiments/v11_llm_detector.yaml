@@ -11,8 +11,8 @@
 #     negative already carries; per-batch pos_weight = n_neg/n_pos handles the
 #     synthetic-minority imbalance (n_syn=4 of P=16).
 #
-# Why this and not the episodic loss: docs/v10_two_model_memo.md §2 shows
-# "LLM-ness" is an easy, GLOBAL axis (a frozen linear probe separates Mistral
+# Why this and not the episodic loss: "LLM-ness" is an easy, global axis
+# (a frozen linear probe separates Mistral
 # text ~100%), which the metric losses only pick up incidentally — and which
 # peaks early then DECAYS as capacity reallocates to per-sender authorship
 # (v9 genuine-vs-syn AUC peaks ep10, decays to ep150). A BCE classification head
@@ -25,7 +25,7 @@
 #
 # Expectation: strong genuine-vs-synthetic AUC/TPR@1%; WEAK genuine-vs-other /
 # high FPR_other — by design, it is the detector half of the two-model design
-# (docs/v10_two_model_memo.md), not an authorship verifier.
+# the two-model design, not an authorship verifier.
 
 encoder:
   model_name_or_path: rrivera1849/LUAR-MUD

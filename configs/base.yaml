@@ -31,10 +31,7 @@ data:
     strip_boilerplate: true
     entity_masking: false
     fix_encoding: true
-    # Sanity floors only (lowered 2026-06-09): production must score short
-    # emails, so training data should contain them. min_body_words and
-    # min_alnum_ratio are now actually enforced by preprocessing._is_usable
-    # (they were declared-but-dead before). See docs/robustness_mechanisms.md §B1.
+    # Sanity floors only — keep short emails so training data covers them.
     min_body_chars: 20
     min_body_words: 5
     min_alnum_ratio: 0.60

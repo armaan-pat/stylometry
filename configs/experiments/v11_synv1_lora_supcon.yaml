@@ -6,8 +6,7 @@
 #   episodic  ->  supcon
 # Holding episode_k=1 fixed, this changes ONLY the objective, so the
 # episodic-arm ↔ this-arm delta isolates the episodic variable-K' loss's
-# contribution alone (docs/v9_lineage_memo.md §4: "is the episodic loss earning
-# its complexity?"). It is NOT the v7/v8 recipe — those used episode_k=4; here
+# contribution alone. It is NOT the v7/v8 recipe — those used episode_k=4; here
 # the embeddings are single-email, exactly as enrollment/inference use them.
 
 encoder:

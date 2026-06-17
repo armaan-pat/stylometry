@@ -5,7 +5,7 @@
 # original synthetic dataset. The ONLY differences are measurement-side, so
 # its checkpoints/metrics are directly comparable with the v7/v8/v9 arms:
 #   - monitor: pauc/genuine_vs_synthetic_5pct (trustworthy checkpoint_best;
-#     the old auc monitor peaked at ~epoch 7 — see docs/EXPERIMENT_STATUS.md)
+#     the old auc monitor peaked at ~epoch 7
 #   - head.eval_score_fns: same per-epoch probe metric set as v7+
 # Used by scripts/run_lineage_v6_v9.sh; not a new experiment in itself.
 

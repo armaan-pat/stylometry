@@ -75,7 +75,7 @@ training:
   mixed_precision: true
   # pAUC at the 5% low-FPR tail — the deployment-relevant region. The old
   # auc/genuine_vs_synthetic monitor peaked at ~epoch 7 and made
-  # checkpoint_best.pt name the wrong file (see docs/EXPERIMENT_STATUS.md).
+  # checkpoint_best.pt name the wrong file.
   monitor: pauc/genuine_vs_synthetic_5pct
   monitor_mode: max
   early_stopping_patience: 0

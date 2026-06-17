@@ -8,7 +8,7 @@ loss is cross-entropy on the sender identity. Because K' is sampled small
 during training, the encoder is explicitly optimized so that the mean of a few
 of a sender's embeddings is already a stable, discriminative description of
 them — low-K robustness baked into the representation rather than patched at
-scoring time (docs/robustness_mechanisms.md §A1).
+scoring time.
 
 Synthetic hard negatives (sender_id ending in "__syn") never form prototypes —
 at deployment, profiles are only ever built from genuine enrollment. They stay

@@ -5,7 +5,7 @@ training corpus under-represents them. Cropping a training email to a random
 contiguous span — labeled as the same sender — makes the SupCon/episodic loss
 explicitly demand that a 15-word fragment of an Alice email embeds near full
 Alice emails, i.e. length-invariant style features. It also manufactures
-unlimited short positives without new data (docs/robustness_mechanisms.md §B1).
+unlimited short positives without new data.
 
 Crops slice the *original string* between word boundaries, so line breaks and
 intra-span whitespace (stylometric signal) are preserved verbatim.

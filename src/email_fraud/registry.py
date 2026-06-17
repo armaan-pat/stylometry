@@ -1,31 +1,10 @@
 """Central component registry.
 
-All user-defined components (encoders, losses, heads, datasets) register
-themselves here via the @register decorator.  The trainer and scripts use
-resolve() to turn a YAML name string into the actual class, keeping all
-component selection config-driven with zero source-code changes.
-
-Why a registry?
----------------
-Without a registry, scripts/train.py would need a long if/elif chain to map
-config strings to classes — and every new encoder or loss would require a
-code change in train.py.  With the registry, adding a new component only
-requires decorating its class:
-
-    @register("encoder", "my_encoder")
-    class MyEncoder(BaseEncoder): ...
-
-The train script then resolves "my_encoder" from the YAML automatically.
-This is the "plugin" pattern common in ML frameworks (e.g. torchvision transforms,
-huggingface hub).
+All components (encoders, losses, heads, datasets) self-register via @register;
+the trainer resolves them by name from YAML without any if/elif dispatch.
 """
 
 from __future__ import annotations
-
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    pass
 
 # ---------------------------------------------------------------------------
 # Global registry: {kind: {name: class}}

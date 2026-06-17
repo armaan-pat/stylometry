@@ -1,7 +1,6 @@
 # V11 (LoRA arm) — the V9 recipe trained on NO-LLM-positive data.
 #
-# This is the missing lineage cell. docs/v9_lineage_memo.md §3 notes that the
-# v7->v8 delta bundles two changes: (a) regenerated corpus + quality filter and
+# The v7->v8 delta bundles two changes that were never isolated: (a) regenerated corpus + quality filter and
 # (b) cross-register LLM POSITIVES (syn-v2's 264 emails stored under the real
 # sender_id). v8->v9 then added the episodic objective + short-mail distribution.
 # Nothing isolates the v8->v9 objective/distribution change from v8's

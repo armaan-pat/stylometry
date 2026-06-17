@@ -3,8 +3,7 @@
 The production head (`PrototypicalHead`) scores with global constants: the z
 divisor is a hard-coded `/3`, the EWMA `alpha` is a fixed `0.1`, the
 cosine->Mahalanobis switch is a hard cliff at `k=5`. This module prototypes the
-"make every parameter a function of the data" direction from
-`docs/scoring_explained.md` so the choices can be ablated head-to-head.
+"make every parameter a function of the data" direction so the choices can be ablated head-to-head.
 
 Design
 ------
