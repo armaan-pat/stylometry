@@ -381,7 +381,7 @@ def _metrics_for_score_set(
     # 2026-06-10 lineage run showed that monitoring the synthetic tail alone
     # selects early checkpoints that have not yet learned to reject real
     # human impostors (v9's ep-10 "best" accepted 59.5% of wrong-sender mail
-    # at the deployed threshold — docs/v9_lineage_results_analysis.md §3).
+    # at the deployed threshold — v9 ep-10 accepted 59.5% of wrong-sender mail).
     # min() can only be gamed by being good at both.
     if (f"{prefix}pauc/genuine_vs_synthetic_5pct" in out
             and f"{prefix}pauc/genuine_vs_other_5pct" in out):

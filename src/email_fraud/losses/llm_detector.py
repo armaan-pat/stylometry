@@ -1,6 +1,6 @@
 """Discriminative LLM-vs-human loss — a binary classification head + BCE.
 
-Motivation (docs/v10_two_model_memo.md §2): "LLM-ness" is an *easy, global*
+Motivation: "LLM-ness" is an *easy, global*
 axis — one generator (Mistral-7B) wrote every synthetic impostor and a frozen
 linear probe separates its text from human text with ~100% accuracy. The
 metric-learning objectives (supcon / episodic) optimize per-sender clustering

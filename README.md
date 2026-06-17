@@ -48,14 +48,7 @@ Add a new encoder with `@register("encoder", "key")` and import it in `encoders/
 
 ```bash
 pip install -e ".[dev]"
-cp .env.example .env          # add WANDB_API_KEY, HF_TOKEN
-
-python scripts/train.py --config configs/experiments/example_luar.yaml
-
-python scripts/evaluate.py \
-    --config configs/experiments/example_luar.yaml \
-    --checkpoint runs/<run>/checkpoint_best.pt \
-    --data-dir data/processed/pan
+cp .env.example .env   # add WANDB_API_KEY, HF_TOKEN
 ```
 
 To add a new experiment, copy an existing YAML under `configs/experiments/` and
@@ -70,20 +63,9 @@ override only the fields that differ from `base.yaml`.
 | 10–24 | `high` | |
 | 25+ | `very_high` | |
 
-## Documentation
-
-| Doc | Contents |
-|-----|----------|
-| [docs/EXPERIMENT_STATUS.md](docs/EXPERIMENT_STATUS.md) | **Start here** — consolidated landscape: what's been tested (V2→V8), best results, what worked/didn't, how to run, time estimates, prioritized next steps. Regenerate tables with `scripts/summarize_results.py`. |
-| [docs/architecture.md](docs/architecture.md) | How the system works end-to-end: batching, LUAR pooling, SupCon, enrollment & scoring |
-| [docs/results.md](docs/results.md) | Experimental results, current gaps, prioritized next steps |
-| [docs/metrics.md](docs/metrics.md) | Every W&B metric the trainer logs and how to read it |
-| [docs/robustness_mechanisms.md](docs/robustness_mechanisms.md) | Design memo: low-K enrollment & short-email robustness as modeling changes (episodic training, hierarchical priors, heteroscedastic scoring) |
-| [docs/v6_vs_v7_memo.md](docs/v6_vs_v7_memo.md), [experiments/v7/CHANGELOG_V7.md](experiments/v7/CHANGELOG_V7.md) | V7 research logs |
-
 ## Open TODOs
 
 | File | What's missing |
 |------|----------------|
-| `training/trainer.py` | Full PAN metrics (AUC/EER/c@1/F0.5u) in validation, not just `evaluate.py` |
+| `training/trainer.py` | Full PAN metrics (AUC/EER/c@1/F0.5u) in validation |
 | `profiles/store.py` | pgvector backend for production-scale profiles |

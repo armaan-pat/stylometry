@@ -102,7 +102,7 @@ class PrototypicalHead(BaseHead):
         )
         # Below this k we fall back to cosine even in mahalanobis modes —
         # per-sender LW shrinkage of a rank-(k-1) sample covariance is too
-        # noisy until k≈5 (see experiments/v7/CHANGELOG_V7.md K-sweep).
+        # noisy until k≈5 (K-sweep ablation: per-sender LW shrinkage is rank-deficient below this).
         self.mahalanobis_min_k = mahalanobis_min_k
         self.ridge = ridge
         # In-memory dict of profiles; keyed by sender_id string.
@@ -234,7 +234,7 @@ class PrototypicalHead(BaseHead):
         Score-fn dispatch:
             "mahalanobis" — per-sender Ledoit-Wolf Mahalanobis distance, flipped
               so higher = more genuine. Wins by +3 AUC pp on g/syn at K=16-25
-              (see experiments/v7/CHANGELOG_V7.md V7.2). Falls back to
+              (V7.2 K-sweep: +3 AUC pp on g/syn at K=16-25). Falls back to
               `linear_z3` when k < mahalanobis_min_k.
             "adaptive_k" — cosine for k < mahalanobis_min_k (Σ too unreliable),
               mahalanobis otherwise. The recommended production default.
