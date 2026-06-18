@@ -1,0 +1,101 @@
+# V13 (LoRA) — v12 recipe with an EXPANDED multi-generator adversary.
+#
+# Motivation (docs/findings_and_roadmap.md P1): v12 closed most of the cross-
+# generator gap (held-out pool AUC 0.696->0.866) but Gemini-2.5-Flash remained the
+# weakest held-out generator (AUC 0.746) and the train set was thin (1045 rows / 2
+# vendors, n_syn=4 recycles fast). V13 tests the "more generator diversity + volume"
+# lever directly.
+#
+# v13 = byte-identical to v12_multigen_lora.yaml EXCEPT:
+#   - augmentation.synthetic_path -> enron_synthetic_v13_train: GPT-4o-mini +
+#     Llama-3.1-70B + DeepSeek-Chat (NEW 3rd vendor), n_per_sender 20 (was 15) ->
+#     ~2-3x per-vendor volume.
+#   - Claude-3.5-Haiku + Gemini-2.5-Flash stay HELD OUT (reuse
+#     data/synthetic/enron_synthetic_v12_heldout) so v12->v13 is apples-to-apples
+#     on the exact same generalization test.
+# Everything else (anti-Goodhart min(other,synthetic) monitor, episodic+crop,
+# LUAR+LoRA, 150 epochs, keep_last_n:1) is unchanged from v12.
+
+encoder:
+  model_name_or_path: rrivera1849/LUAR-MUD
+  pooling: luar_episode
+  freeze_backbone: false
+  lora:
+    r: 16
+    alpha: 32
+    target_modules:
+      - query
+      - value
+      - key
+    dropout: 0.05
+  max_length: 512
+  projection_dim: 128
+  episode_k: 1
+  trust_remote_code: true
+
+loss:
+  name: episodic
+  temperature: 0.05
+  support_k_min: 2
+  support_k_max: 6
+  supcon_weight: 0.5
+
+head:
+  name: prototypical
+  score_fn: adaptive_k
+  eval_score_fns:
+    - linear_z3
+    - cosine
+    - sigmoid_z
+    - z_persender_sigmoid
+
+data:
+  processed_dir: data/processed/enron_shortmail
+  train_senders: 100
+  emails_per_sender_k: 8
+  val_split: 0.1
+  test_split: 0.1
+  preprocessing:
+    strip_signatures: false
+    min_body_chars: 20
+    min_body_words: 5
+  augmentation:
+    synthetic_path: data/synthetic/enron_synthetic_v13_train
+    n_syn_per_batch: 4
+    crop_prob: 0.3
+    crop_min_words: 5
+    crop_max_words: 60
+    register_stratified: true
+
+training:
+  epochs: 150
+  batch_size: 128
+  lr: 2.0e-4
+  scheduler: cosine
+  warmup_steps: 200
+  grad_clip: 1.0
+  mixed_precision: true
+  monitor: pauc/min_other_synthetic_5pct
+  monitor_mode: max
+  early_stopping_patience: 0
+  early_stopping_min_delta: 1.0e-3
+  keep_last_n: 1
+  hard_negative_mining:
+    enabled: true
+    warmup_epochs: 20
+    ramp_epochs: 30
+    interval: 5
+    n_pairs: 20
+    max_hard_fraction: 0.5
+
+wandb:
+  name: v13-multigen-lora
+  tags:
+    - luar
+    - lora
+    - episodic
+    - multigen
+    - v13
+    - deepseek
+    - heldout-claude-gemini
+  notes: "V13 LoRA: v12 recipe with expanded adversary (GPT-4o-mini + Llama-3.1-70B + DeepSeek-Chat, n_per_sender 20); Claude + Gemini held out for eval. Anti-Goodhart min(other,synthetic) monitor. Tests the more-diversity+volume lever (roadmap P1)."

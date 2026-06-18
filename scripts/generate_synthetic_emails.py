@@ -129,6 +129,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from datasets import Dataset, load_from_disk
+from dotenv import load_dotenv
 from tqdm import tqdm
 
 from email_fraud.config import load_config
@@ -139,6 +140,10 @@ from email_fraud.data.register import detect_register, partition_by_register
 # lazily inside the backends, so an API-only run needs no GPU stack and an
 # HF-only run needs no `requests`.
 from llm_backends import build_generators, parse_spec
+
+# Load project .env so API backends (e.g. openrouter:*) pick up keys like
+# OPENROUTER_API_KEY — mirrors scripts/train.py and scripts/eval_ood.py.
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 # ---------------------------------------------------------------------------
 # Topic pools — sampled per generation to prevent topic leakage from examples.

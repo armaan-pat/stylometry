@@ -47,3 +47,7 @@ Thumbs.db
 
 logs/
 runs/
+
+# Derived eval corpora / large pair files (regenerable via prepare_external_pairs.py / build_ood_eval.py)
+data/ood/
+results/**/*.jsonl

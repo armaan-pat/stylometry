@@ -55,6 +55,27 @@ MAHAL_MIN_K = 5
 MAHAL_WINDOW = 10
 RIDGE = 1e-4
 
+# Length-matched enrollment (opt-in, roadmap P3). When a query's length bucket is
+# known, score it against the sender centroid built only from same-bucket
+# enrollment emails — but only if that subset has at least MIN_BUCKET_K emails,
+# else fall back to the full-enrollment centroid (a 1-2 email centroid is noisier
+# than the full one). Bucket cutoffs are the canonical eval-time definition from
+# scripts/build_ood_eval.py (the same one that produced the lenmix ~0.50-0.64
+# numbers we're trying to beat) — do not invent new cutoffs.
+MIN_BUCKET_K = 3
+_SHORT_MAX_WORDS = 20
+_LONG_MIN_WORDS = 80
+
+
+def len_bucket(text: str) -> str:
+    """short (<=20 words) / long (>=80) / medium — canonical eval-time buckets."""
+    n = len(text.split())
+    if n <= _SHORT_MAX_WORDS:
+        return "short"
+    if n >= _LONG_MIN_WORDS:
+        return "long"
+    return "medium"
+
 
 # ---------------------------------------------------------------------------
 # Per-sender statistics
@@ -72,6 +93,10 @@ class SenderStats:
     k: int
     loo_z: np.ndarray                # leave-one-out genuine z-scores (k,)
     z_scale: float = 0.0             # data-driven per-sender divisor (filled in pass 2)
+    # Length-matched enrollment (opt-in): per-bucket L2-normed centroids + counts.
+    # None unless ProfileBank.fit was given enroll_buckets — keeps default inert.
+    bucket_centroids: dict[str, np.ndarray] | None = None
+    bucket_k: dict[str, int] | None = None
     _prec: np.ndarray | None = field(default=None, repr=False)  # lazy LW precision
 
 
@@ -83,16 +108,27 @@ class ProfileBank:
         self.stats: dict[str, SenderStats] = {}
         self.global_z_scale: float = 1.0   # pooled p90 of all genuine LOO z
         self._d: int | None = None
+        # Transient: set per-query by score_pool when length-matched enrollment is
+        # active, so cos/z/mahalanobis pick the same-bucket centroid. None (the
+        # default) -> the full-enrollment centroid, i.e. unchanged behavior.
+        self._active_bucket: str | None = None
 
     # -- fit -------------------------------------------------------------
 
-    def fit(self, embeddings: np.ndarray, sender_ids: list[str]) -> "ProfileBank":
+    def fit(
+        self,
+        embeddings: np.ndarray,
+        sender_ids: list[str],
+        enroll_buckets: list[str] | None = None,
+    ) -> "ProfileBank":
         embeddings = _l2norm(np.asarray(embeddings, dtype=np.float64))
         self._d = embeddings.shape[1]
 
         by_sender: dict[str, list[int]] = {}
         for i, s in enumerate(sender_ids):
             by_sender.setdefault(s, []).append(i)
+
+        bucket_arr = np.asarray(enroll_buckets) if enroll_buckets is not None else None
 
         # Pass 1: per-sender geometry + leave-one-out genuine z distribution.
         for sid, idx in by_sender.items():
@@ -102,10 +138,21 @@ class ProfileBank:
             spread = float((1.0 - embs @ centroid).mean())
             centroid_ewma, spread_ewma = self._ewma_centroid(embs)
             loo_z = self._leave_one_out_z(embs)
+            bucket_centroids: dict[str, np.ndarray] | None = None
+            bucket_k: dict[str, int] | None = None
+            if bucket_arr is not None:
+                # Group this sender's enrollment by length bucket; one centroid each.
+                sb = bucket_arr[idx]
+                bucket_centroids, bucket_k = {}, {}
+                for b in np.unique(sb):
+                    rows = embs[sb == b]
+                    bucket_centroids[str(b)] = _l2norm(rows.mean(axis=0))
+                    bucket_k[str(b)] = int(rows.shape[0])
             self.stats[sid] = SenderStats(
                 sid=sid, embs=embs, centroid=centroid,
                 centroid_ewma=centroid_ewma, spread=spread,
                 spread_ewma=spread_ewma, k=k, loo_z=loo_z,
+                bucket_centroids=bucket_centroids, bucket_k=bucket_k,
             )
 
         # Pass 2: global prior, then shrink each sender's divisor toward it.
@@ -159,9 +206,25 @@ class ProfileBank:
 
     # -- query-time helpers ---------------------------------------------
 
+    def centroid_for(self, sid: str, bucket: str | None = None) -> np.ndarray:
+        """Pick the length-matched centroid when available, else the full one.
+
+        `bucket` defaults to the transient `_active_bucket` set by score_pool.
+        Falls back to the full-enrollment centroid unless the same-bucket subset
+        has at least MIN_BUCKET_K emails (a centroid from 1-2 emails is noisier
+        than the full set, so length-matching can only help or no-op).
+        """
+        s = self.stats[sid]
+        b = bucket if bucket is not None else self._active_bucket
+        if b is not None and s.bucket_centroids is not None:
+            c = s.bucket_centroids.get(b)
+            if c is not None and (s.bucket_k or {}).get(b, 0) >= MIN_BUCKET_K:
+                return c
+        return s.centroid
+
     def cos(self, query: np.ndarray, sid: str, which: str = "mean") -> float:
         s = self.stats[sid]
-        c = s.centroid if which == "mean" else s.centroid_ewma
+        c = self.centroid_for(sid) if which == "mean" else s.centroid_ewma
         return float(query @ c)
 
     def z(self, query: np.ndarray, sid: str, which: str = "mean") -> float:
@@ -190,9 +253,8 @@ class ProfileBank:
         return prec
 
     def mahalanobis(self, query: np.ndarray, sid: str, prec: np.ndarray | None = None) -> float:
-        s = self.stats[sid]
         P = prec if prec is not None else self.precision(sid)
-        diff = query - s.centroid
+        diff = query - self.centroid_for(sid)
         return float(np.sqrt(max(diff @ P @ diff, 0.0)))
 
 
@@ -259,7 +321,7 @@ def _s_mahal_blend(bank: ProfileBank, q: np.ndarray, sid: str) -> float:
     w = float(np.clip((s.k - MAHAL_MIN_K) / MAHAL_WINDOW, 0.0, 1.0))
     d = bank._d or s.embs.shape[1]
     P = w * bank.precision(sid) + (1.0 - w) * np.eye(d)
-    diff = q - s.centroid
+    diff = q - bank.centroid_for(sid)
     return -float(np.sqrt(max(diff @ P @ diff, 0.0)))
 
 
@@ -289,8 +351,22 @@ def score_pool(
     queries: np.ndarray,
     sender_ids: list[str],
     scorer: str,
+    query_buckets: list[str] | None = None,
 ) -> np.ndarray:
-    """Apply one scorer to a pool of (query, claimed_sender) pairs."""
+    """Apply one scorer to a pool of (query, claimed_sender) pairs.
+
+    When `query_buckets` is given (length-matched enrollment), each query is
+    scored against its claimed sender's same-bucket centroid via the transient
+    `bank._active_bucket`. Default (None) leaves `_active_bucket` unset, so the
+    full-enrollment centroid is used and behavior is byte-identical to before.
+    """
     fn = SCORERS[scorer]
     queries = _l2norm(np.asarray(queries, dtype=np.float64))
-    return np.array([fn(bank, queries[i], sender_ids[i]) for i in range(len(sender_ids))])
+    out = np.empty(len(sender_ids), dtype=np.float64)
+    try:
+        for i in range(len(sender_ids)):
+            bank._active_bucket = query_buckets[i] if query_buckets is not None else None
+            out[i] = fn(bank, queries[i], sender_ids[i])
+    finally:
+        bank._active_bucket = None
+    return out

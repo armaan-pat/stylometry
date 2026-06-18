@@ -1,0 +1,96 @@
+# V12 (LoRA) — the v11-lora recipe retrained against a MULTI-GENERATOR adversary.
+#
+# Motivation: v11-lora's LLM-detection was a single-generator (Mistral-7B) shortcut.
+# Measured 2026-06-17: TPR@1%FPR_syn collapses 0.91 (Mistral) -> 0.045 (held-out
+# GPT/Claude/Llama/Gemini) on the same probe/senders. See
+# memory `multigen-generalization-gap` and results/v12/heldoutgen_v11lora.json.
+#
+# v12 = byte-identical to v11_synv1_lora.yaml EXCEPT:
+#   - augmentation.synthetic_path -> multi-generator TRAINING set (GPT-4o-mini +
+#     Llama-3.1-70B). Claude-3.5-Haiku + Gemini-2.5-Flash are held OUT for eval.
+#   - training.monitor -> pauc/min_other_synthetic_5pct (anti-Goodhart composite:
+#     the WORSE of the two impostor tails, so checkpoint selection can't slide to
+#     the easy synthetic axis — avoids the v9@ep10 / detector@ep11 Goodhart).
+
+encoder:
+  model_name_or_path: rrivera1849/LUAR-MUD
+  pooling: luar_episode
+  freeze_backbone: false
+  lora:
+    r: 16
+    alpha: 32
+    target_modules:
+      - query
+      - value
+      - key
+    dropout: 0.05
+  max_length: 512
+  projection_dim: 128
+  episode_k: 1
+  trust_remote_code: true
+
+loss:
+  name: episodic
+  temperature: 0.05
+  support_k_min: 2
+  support_k_max: 6
+  supcon_weight: 0.5
+
+head:
+  name: prototypical
+  score_fn: adaptive_k
+  eval_score_fns:
+    - linear_z3
+    - cosine
+    - sigmoid_z
+    - z_persender_sigmoid
+
+data:
+  processed_dir: data/processed/enron_shortmail
+  train_senders: 100
+  emails_per_sender_k: 8
+  val_split: 0.1
+  test_split: 0.1
+  preprocessing:
+    strip_signatures: false
+    min_body_chars: 20
+    min_body_words: 5
+  augmentation:
+    synthetic_path: data/synthetic/enron_synthetic_v12_train
+    n_syn_per_batch: 4
+    crop_prob: 0.3
+    crop_min_words: 5
+    crop_max_words: 60
+    register_stratified: true
+
+training:
+  epochs: 150
+  batch_size: 128
+  lr: 2.0e-4
+  scheduler: cosine
+  warmup_steps: 200
+  grad_clip: 1.0
+  mixed_precision: true
+  monitor: pauc/min_other_synthetic_5pct
+  monitor_mode: max
+  early_stopping_patience: 0
+  early_stopping_min_delta: 1.0e-3
+  keep_last_n: 1
+  hard_negative_mining:
+    enabled: true
+    warmup_epochs: 20
+    ramp_epochs: 30
+    interval: 5
+    n_pairs: 20
+    max_hard_fraction: 0.5
+
+wandb:
+  name: v12-multigen-lora
+  tags:
+    - luar
+    - lora
+    - episodic
+    - multigen
+    - v12
+    - heldout-claude-gemini
+  notes: "V12 LoRA: v11 recipe retrained on multi-generator adversary (GPT-4o-mini + Llama-3.1-70B); Claude + Gemini held out for eval. Anti-Goodhart min(other,synthetic) monitor."

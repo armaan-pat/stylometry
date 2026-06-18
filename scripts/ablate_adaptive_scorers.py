@@ -71,7 +71,9 @@ import email_fraud.losses      # noqa: F401
 from email_fraud.config import load_config
 from email_fraud.data.enron import EnronDataset
 from email_fraud.registry import resolve as resolve_component
-from email_fraud.scoring.adaptive import ProfileBank, SCORERS, BASELINE, score_pool
+from email_fraud.scoring.adaptive import (
+    ProfileBank, SCORERS, BASELINE, score_pool, len_bucket,
+)
 from email_fraud.scoring.metrics import (
     compute_auc,
     compute_eer,
@@ -207,6 +209,8 @@ def _paired_bootstrap(
 def _score_all(
     encoder, device: str, probe: dict, seed: int, ewma_alpha: float,
     crop_syn: bool = False,
+    length_matched: bool = False,
+    query_bucket: str | None = None,
 ) -> tuple[dict[str, dict[str, np.ndarray]], float]:
     """Encode pools, fit a ProfileBank, return per-scorer pool scores + mean LW-α.
 
@@ -216,6 +220,12 @@ def _score_all(
     augmentation). The standard synthetic pool has no emails under 26 words,
     so without this pool short-query forgery is unmeasured
     (docs/v9_lineage_results_analysis.md §4).
+
+    length_matched (roadmap P3): build per-bucket enrollment centroids and score
+    each query against its claimed sender's same-bucket centroid (fallback to the
+    full centroid below MIN_BUCKET_K). query_bucket restricts every QUERY pool to
+    one length bucket (e.g. "short") so short-query verification is isolated. Both
+    default off → byte-identical to the prior behavior.
     """
     enroll_emb = _encode_texts(encoder, probe["enroll_texts"], device)
     gen_emb = _encode_texts(encoder, probe["gen_texts"], device)
@@ -232,7 +242,16 @@ def _score_all(
         cropped = [random_word_crop(t, crng, 5, 60) for t in probe["syn_texts"]]
         syn_crop_emb = _encode_texts(encoder, cropped, device)
 
-    bank = ProfileBank(ewma_alpha=ewma_alpha).fit(enroll_emb, probe["enroll_sids"])
+    enroll_buckets = (
+        [len_bucket(t) for t in probe["enroll_texts"]] if length_matched else None
+    )
+    bank = ProfileBank(ewma_alpha=ewma_alpha).fit(
+        enroll_emb, probe["enroll_sids"], enroll_buckets=enroll_buckets,
+    )
+    if length_matched:
+        from collections import Counter
+        logger.info("Length-matched enrollment ON — enroll bucket histogram: %s",
+                    dict(Counter(enroll_buckets)))
     mean_lw_alpha = _mean_lw_shrinkage(bank)
 
     # Each other-sender impostor gets a random claimed profiled sender, mirroring
@@ -243,20 +262,56 @@ def _score_all(
     gen_claimed = list(probe["gen_sids"])
     syn_claimed = list(probe["syn_sids"])
 
+    # (embeddings, claimed_senders, query_texts) per pool, so we can both restrict
+    # to one query bucket and compute per-query buckets for length matching.
+    pools = {
+        "genuine": (gen_emb, gen_claimed, list(probe["gen_texts"])),
+        "other": (oth_emb, oth_claimed, list(probe["other_texts"])),
+        "synthetic": (syn_emb, syn_claimed, list(probe["syn_texts"])),
+    }
+    if query_bucket is not None:
+        for key, (emb, claimed, texts) in pools.items():
+            if len(emb) == 0:
+                continue
+            keep = [len_bucket(t) == query_bucket for t in texts]
+            pools[key] = (
+                emb[np.asarray(keep)],
+                [c for c, m in zip(claimed, keep) if m],
+                [t for t, m in zip(texts, keep) if m],
+            )
+        logger.info(
+            "Query-bucket filter '%s' → genuine %d, other %d, synthetic %d",
+            query_bucket, len(pools["genuine"][0]),
+            len(pools["other"][0]), len(pools["synthetic"][0]),
+        )
+
+    # Precompute per-query buckets once (not per scorer) when length matching.
+    qbuckets = {
+        key: ([len_bucket(t) for t in texts] if length_matched else None)
+        for key, (_, _, texts) in pools.items()
+    }
+
     scorer_scores: dict[str, dict[str, np.ndarray]] = {}
     for name in SCORERS:
+        g_emb, g_cl, _ = pools["genuine"]
+        o_emb, o_cl, _ = pools["other"]
+        s_emb, s_cl, _ = pools["synthetic"]
         scorer_scores[name] = {
-            "genuine": score_pool(bank, gen_emb, gen_claimed, name),
-            "other": score_pool(bank, oth_emb, oth_claimed, name),
+            "genuine": score_pool(bank, g_emb, g_cl, name, query_buckets=qbuckets["genuine"]),
+            "other": score_pool(bank, o_emb, o_cl, name, query_buckets=qbuckets["other"]),
             "synthetic": (
-                score_pool(bank, syn_emb, syn_claimed, name)
-                if len(syn_emb) else np.array([])
+                score_pool(bank, s_emb, s_cl, name, query_buckets=qbuckets["synthetic"])
+                if len(s_emb) else np.array([])
             ),
         }
         if len(syn_crop_emb):
             # Crops keep the mimicked sender id — claimed senders unchanged.
+            # Crops are already short spans; bucket them too when length-matching.
+            crop_qb = (
+                ["short"] * len(syn_crop_emb) if length_matched else None
+            )
             scorer_scores[name]["syn_crop"] = score_pool(
-                bank, syn_crop_emb, syn_claimed, name
+                bank, syn_crop_emb, syn_claimed, name, query_buckets=crop_qb
             )
     return scorer_scores, mean_lw_alpha
 
@@ -326,6 +381,14 @@ def parse_args() -> argparse.Namespace:
                         "under 26 words, so short-query forgery is otherwise unmeasured).")
     p.add_argument("--k-sweep", default=None,
                    help="Comma-separated enroll sizes for a point-estimate sweep, e.g. 4,8,16,25.")
+    p.add_argument("--length-matched-enrollment", action="store_true",
+                   help="Roadmap P3: score each query against its claimed sender's "
+                        "same-length-bucket enrollment centroid (fallback to full "
+                        "centroid below MIN_BUCKET_K). Default off → unchanged.")
+    p.add_argument("--query-bucket", default=None, choices=["short", "medium", "long"],
+                   help="Restrict every query pool to this length bucket so short-query "
+                        "verification is isolated (pair with --split other for the "
+                        "cross-length authorship signal). Default: all lengths.")
     # Expanded 2026-06-09 to match the bigger CentroidProbe (configs/base.yaml
     # `probe:`): the old 30×4/200/200 probe gave ±0.13-wide tpr1 CIs — wider
     # than most candidate-scorer deltas. Builders cap to availability, so these
@@ -391,6 +454,7 @@ def main() -> None:
     )
     scorer_scores, lw_alpha = _score_all(
         encoder, device, probe, args.seed, args.ewma_alpha, crop_syn=args.crop_syn,
+        length_matched=args.length_matched_enrollment, query_bucket=args.query_bucket,
     )
     extras = {name: _operating_point_extras(scorer_scores[name]) for name in SCORERS}
 
@@ -425,7 +489,11 @@ def main() -> None:
         per_k: dict[int, dict[str, dict[str, np.ndarray]]] = {}
         for k in ks:
             pk = build_probe(k)
-            ss, _ = _score_all(encoder, device, pk, args.seed, args.ewma_alpha)
+            ss, _ = _score_all(
+                encoder, device, pk, args.seed, args.ewma_alpha,
+                length_matched=args.length_matched_enrollment,
+                query_bucket=args.query_bucket,
+            )
             per_k[k] = ss
         for name in ranked:
             vals = {}
