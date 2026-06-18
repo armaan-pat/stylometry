@@ -296,12 +296,28 @@ class SyntheticBalancedSampler(Sampler[list[int]]):
         self._hard_sender_weights = {s: w / max_w for s, w in weights.items()}
         self._hard_fraction = hard_fraction
 
+    def _n_batches(self) -> int:
+        """Batches per epoch = enough to cover the filler (real-author) pool once,
+        not just the synthetic pairs. With few synthetic pairs but many unpaired real
+        authors (e.g. Enron+blog: 44 pairs, 800 blog fillers), keying the epoch on the
+        44 pairs starves the fillers; instead cycle the pairs across more batches so
+        every real author is seen ~once/epoch. No-op when all real senders are paired
+        (filler_pool//slots <= pairs//n_syn), so v11/v12/v13 behavior is unchanged."""
+        if self.n_syn <= 0:
+            return 0
+        slots_real_only = self.p - 2 * self.n_syn
+        n_pairs = len(self._eligible_pairs) // self.n_syn
+        filler_pool = len(self._eligible_real_only) + len(self._eligible_paired_real)
+        n_fillers = filler_pool // slots_real_only if slots_real_only > 0 else n_pairs
+        return max(n_pairs, n_fillers)
+
     def __iter__(self):
         pairs = list(self._eligible_pairs)
         self._rng.shuffle(pairs)
 
         slots_real_only = self.p - 2 * self.n_syn
-        n_batches = len(pairs) // self.n_syn if self.n_syn > 0 else 0
+        n_batches = self._n_batches()
+        pair_cursor = 0  # cycle through (reshuffled) pairs across all batches
 
         real_only_set = set(self._eligible_real_only)
         n_filler_real_only = 0
@@ -312,7 +328,13 @@ class SyntheticBalancedSampler(Sampler[list[int]]):
         exposure_as_filler: _Counter = _Counter()
 
         for i in range(n_batches):
-            batch_pairs = pairs[i * self.n_syn : (i + 1) * self.n_syn]
+            # Cycle the synthetic pairs (reshuffle when exhausted) so each batch gets
+            # n_syn distinct pairs even when n_batches > len(pairs)//n_syn.
+            if pair_cursor + self.n_syn > len(pairs):
+                self._rng.shuffle(pairs)
+                pair_cursor = 0
+            batch_pairs = pairs[pair_cursor : pair_cursor + self.n_syn]
+            pair_cursor += self.n_syn
             chosen_pair_reals = {real for real, _ in batch_pairs}
 
             filler_candidates = list(self._eligible_real_only) + [
@@ -382,4 +404,4 @@ class SyntheticBalancedSampler(Sampler[list[int]]):
         return stats
 
     def __len__(self) -> int:
-        return len(self._eligible_pairs) // self.n_syn if self.n_syn > 0 else 0
+        return self._n_batches()

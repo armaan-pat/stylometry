@@ -1,0 +1,92 @@
+# V14b (LoRA) — the SYNTHESIS: identity diversity (v14) + synthetic hard-negatives (v12).
+#
+# v14 proved identity expansion SOLVES content-invariance (PAN cross-topic 0.78->0.88) but
+# dropping synthetics collapsed imitation-catching (gen:Claude 0.83->0.54) and blog dilution
+# hurt Enron slices (docs/v14_results.md). v14b combines both, enabled by the fixed
+# SyntheticBalancedSampler (src/email_fraud/data/samplers.py): its epoch now scales to cover
+# the 800 blog fillers (~105 batches) instead of bottlenecking on the 44 synthetic pairs (~11
+# batches), while still guaranteeing n_syn synthetic-real pairs/batch. Net per epoch: every
+# blog author seen ~once (content-invariance) AND Enron+synthetics seen heavily via guaranteed
+# pairs (~3600 Enron slot-appearances → imitation-catching + Enron in-domain precision, which
+# also fixes the v14 dilution since only 44 Enron authors absorb those slots).
+#
+# = v14_manyauthor_lora EXCEPT: synthetics re-enabled + anti-Goodhart monitor.
+
+encoder:
+  model_name_or_path: rrivera1849/LUAR-MUD
+  pooling: luar_episode
+  freeze_backbone: false
+  lora:
+    r: 16
+    alpha: 32
+    target_modules:
+      - query
+      - value
+      - key
+    dropout: 0.05
+  max_length: 512
+  projection_dim: 128
+  episode_k: 1
+  trust_remote_code: true
+
+loss:
+  name: episodic
+  temperature: 0.05
+  support_k_min: 2
+  support_k_max: 6
+  supcon_weight: 0.5
+
+head:
+  name: prototypical
+  score_fn: adaptive_k
+  eval_score_fns:
+    - linear_z3
+    - cosine
+    - sigmoid_z
+    - z_persender_sigmoid
+
+data:
+  processed_dir: data/processed/enron_blog
+  train_senders: 800
+  emails_per_sender_k: 8
+  val_split: 0.1
+  test_split: 0.1
+  preprocessing:
+    strip_signatures: false
+    min_body_chars: 20
+    min_body_words: 5
+  augmentation:
+    synthetic_path: data/synthetic/enron_synthetic_v12_train
+    n_syn_per_batch: 4
+    crop_prob: 0.3
+    crop_min_words: 5
+    crop_max_words: 60
+    register_stratified: false
+
+training:
+  epochs: 80
+  batch_size: 128
+  lr: 2.0e-4
+  scheduler: cosine
+  warmup_steps: 200
+  grad_clip: 1.0
+  mixed_precision: true
+  monitor: pauc/min_other_synthetic_5pct
+  monitor_mode: max
+  early_stopping_patience: 0
+  early_stopping_min_delta: 1.0e-3
+  keep_last_n: 1
+  hard_negative_mining:
+    enabled: false
+
+wandb:
+  name: v14b-manyauthor-syn-lora
+  tags:
+    - luar
+    - lora
+    - episodic
+    - v14b
+    - many-author
+    - synthetic
+    - synthesis
+  notes: "V14b: identity diversity (844 authors) + synthetic hard-negatives (GPT+Llama), fixed SyntheticBalancedSampler so blog authors are covered AND synthetic pairs guaranteed. Target: keep PAN ~0.88 AND recover gen: ~0.83 / pool TPR@1% ~0.13."
