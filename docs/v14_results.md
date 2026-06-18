@@ -79,9 +79,57 @@ v14 and v12 each win on one axis; the production model needs both:
 **Stretch (from the research, if v14b's content-invariance needs more):** content-controlled
 positives (style-held/content-changed paraphrases) and all-layers pooling.
 
+## 3b. v14b RESULT — the synthesis works; the cross-generator gap is closed
+
+v14b = identity diversity (844 authors) **+** synthetic hard-negatives (GPT+Llama),
+enabled by the fixed `SyntheticBalancedSampler` (epoch scales to 105 batches → blog authors
+covered AND synthetic pairs guaranteed; Enron upweighted via pairs, fixing v14's dilution).
+Model: `runs/v14b/lora/checkpoint_best.pt`. Eval is apples-to-apples with v12 (same
+held-out Claude+Gemini pool, same probe).
+
+**v14b beats v12 on EVERY axis simultaneously:**
+
+| Axis | v12 | v14 | **v14b** |
+|---|---|---|---|
+| Held-out **Gemini** AUC (the stuck one) | 0.746 | 0.573 | **0.953** |
+| Held-out **Claude** AUC | 0.829 | 0.541 | **0.972** |
+| Held-out pool AUC (mahalanobis) | 0.854 | 0.59 | **0.975** |
+| Held-out pool TPR@5% | 0.394 | 0.06 | **0.879** |
+| PAN cross-topic (content-invariance) | 0.779 | 0.879 | **0.857** |
+| Blog held-out (150 authors) | 0.786 | 0.916 | **0.909** |
+| register:cross / lenmix / len:short | 0.95/0.92/0.92 | 0.71/0.57/0.65 | **0.969/0.93/0.925** |
+
+The **cross-generator generalization gap — the project's central problem since v11 — is
+essentially closed**: Gemini-2.5-Flash, stuck at ~0.75 through v12/v13, is now **0.953** on
+the same held-out eval. Content-invariance (PAN 0.857) and identity scale (blog 0.909) from
+v14 are kept; the Enron in-domain slices are fully recovered. Two drivers: (a) the sampler
+fix gave ~5× more synthetic-pair exposure/epoch (105 vs 11 batches), and (b) the richer
+844-author backbone makes the style centroid sharper, so LLM imitations fall further from it
+— validating the core thesis that **better authorship modeling is what catches imitations**.
+
+**Wrong-human guardrail — read carefully (the v9@ep10 lesson):** at the synthetic-anchored
+threshold, `baseline_linear_z3` shows `fpr_other@5 = 0.30` — but this is a **scorer/threshold
+artifact, not a real leak**: `auc_g_other = 0.96` (genuine vs wrong-human separates
+excellently in *ranking*), and **mahalanobis holds the guardrail at `fpr_other@5 = 0.083`
+(≤0.10) with TPR@5% 0.879, AUC 0.975**. Because v14b separates synthetics so well, anchoring
+the threshold purely on the (now-easy) synthetic pool places it poorly for the other-sender
+axis under the linear scorer. **Deployment recommendation: mahalanobis scorer** (satisfies
+the guardrail; still catches ~88% of forgeries at 5% FPR). The `baseline_linear_z3`
+TPR@1%=0.591 operating point is Goodharted (leaks 30% wrong-human) — do not ship it.
+
+**Conclusion: v14b is the performance-grade model.** Content-invariant authorship backbone
+(many identities) + synthetic-hard-negative imitation-catching + a trustworthy 150-author
+eval + a guardrail-satisfying operating point (mahalanobis). Remaining honest caveats: blog
+is partly in-domain (PAN is the clean OOD); the held-out generators (Claude+Gemini) transfer
+from GPT+Llama training but a fully novel future vendor should be spot-checked; the operating
+point should be set on `min(other,synthetic)`, not the synthetic pool alone.
+
 ## 4. Artifacts
-- Model: `runs/v14/lora/checkpoint_best.pt` (ep88). Config: `configs/experiments/v14_manyauthor_lora.yaml`.
+- **Best model (performance-grade): `runs/v14b/lora/checkpoint_best.pt`** — config
+  `configs/experiments/v14b_manyauthor_syn_lora.yaml`. Deploy with the **mahalanobis** scorer.
+- v14 (identity-only): `runs/v14/lora/checkpoint_best.pt` (ep88), `v14_manyauthor_lora.yaml`.
 - Data: `data/processed/blog_authors`, `data/processed/enron_blog` (844 authors).
-- Eval: `results/v14/blog_probe_v14lora.json`, `ood_v14lora_heldoutCG.json`,
-  `heldoutCG_v14lora.json`; baseline `blog_probe_v12lora.json`.
+- Eval: `results/v14/{blog_probe,ood,heldoutCG}_v14blora*` and `_v14lora*`; v12 baselines in
+  `results/v14/blog_probe_v12lora.json` + `results/v12/`.
 - Scripts: `scripts/prepare_blog_authors.py`, `build_blog_probe.py`, `run_v14_eval.sh`.
+- Sampler fix that enabled v14b: `src/email_fraud/data/samplers.py` (`SyntheticBalancedSampler`).
