@@ -75,6 +75,16 @@ def parse_args() -> argparse.Namespace:
         help="Path to a .pt checkpoint file to resume training from.",
     )
     parser.add_argument("--device", default=None, help="Override torch device (cpu/cuda).")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help=(
+            "Global training seed: seeds torch/numpy/python RNG (weight init, dropout) "
+            "and the train/val PK samplers (data order). Default 0 reproduces all prior "
+            "runs byte-for-byte. Vary it for reproduction-seed / variance experiments."
+        ),
+    )
     parser.add_argument("--runpod", action="store_true", help="Launch on RunPod.")
     return parser.parse_args()
 
@@ -173,6 +183,20 @@ def _run_training(cfg, EncoderClass, LossClass, HeadClass, args, output_dir: Pat
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Using device: %s", device)
 
+    # Seed all RNGs that affect a run: weight init / dropout (torch, numpy, python)
+    # and the sampler data order (threaded into the PK/SyntheticBalanced samplers
+    # below). seed=0 (default) is byte-identical to every run before --seed existed.
+    import random as _random
+
+    import numpy as _np
+    _seed = getattr(args, "seed", 0)
+    torch.manual_seed(_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(_seed)
+    _np.random.seed(_seed)
+    _random.seed(_seed)
+    logger.info("Global training seed: %d", _seed)
+
     encoder = EncoderClass(cfg.encoder)
     loss_fn = LossClass(
         **{
@@ -240,7 +264,7 @@ def _run_training(cfg, EncoderClass, LossClass, HeadClass, args, output_dir: Pat
             p=p,
             k=cfg.data.emails_per_sender_k,
             n_syn=n_syn,
-            seed=0,
+            seed=_seed,
             register_labels=register_labels,
         )
     else:
@@ -249,7 +273,7 @@ def _run_training(cfg, EncoderClass, LossClass, HeadClass, args, output_dir: Pat
             sender_ids=train_dataset.sender_ids,
             p=p,
             k=cfg.data.emails_per_sender_k,
-            seed=0,
+            seed=_seed,
             register_labels=register_labels,
         )
 
@@ -294,7 +318,7 @@ def _run_training(cfg, EncoderClass, LossClass, HeadClass, args, output_dir: Pat
             sender_ids=val_dataset.sender_ids,
             p=val_p,
             k=k,
-            seed=1,
+            seed=_seed + 1,
         )
         val_loader = DataLoader(
             val_dataset,
