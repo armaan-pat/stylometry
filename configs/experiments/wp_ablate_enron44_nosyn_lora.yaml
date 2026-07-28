@@ -1,0 +1,108 @@
+# WHITEPAPER 2x2 ablation — the missing (44 authors, NO synthetics) corner.
+#
+# Completes the identity x synthetic factorial:
+#   (844, +syn) = v14b      (844, -syn) = v14
+#   ( 44, +syn) = v12       ( 44, -syn) = THIS RUN
+#
+# = v14_manyauthor_lora recipe EXACTLY, except the author pool is the 44 Enron
+#   senders (enron_shortmail) instead of 844 (enron_blog). Synthetics stay OFF
+#   (PKSampler), monitor stays pauc/genuine_vs_other_5pct, HNM off. This isolates
+#   the identity-expansion lever with synthetics held off: compare directly to
+#   v14 (844, -syn).
+#
+# STEP-BUDGET NOTE: PKSampler yields n_senders//p batches/epoch (p = batch/ k = 16).
+#   844 authors -> 52 batches/ep; 44 authors -> 2 batches/ep. To avoid confounding
+#   identity with optimisation budget, epochs are set so total gradient steps land
+#   BETWEEN v12 (~1650) and v14 (5200): 1300 ep x 2 = ~2600 steps. The per-epoch
+#   CentroidProbe is shrunk (it only selects the checkpoint; the headline eval is the
+#   separate heldoutCG ablation) so 1300 cheap epochs fit ~2.5h on one A40.
+
+encoder:
+  model_name_or_path: rrivera1849/LUAR-MUD
+  pooling: luar_episode
+  freeze_backbone: false
+  lora:
+    r: 16
+    alpha: 32
+    target_modules:
+      - query
+      - value
+      - key
+    dropout: 0.05
+  max_length: 512
+  projection_dim: 128
+  episode_k: 1
+  trust_remote_code: true
+
+loss:
+  name: episodic
+  temperature: 0.05
+  support_k_min: 2
+  support_k_max: 6
+  supcon_weight: 0.5
+
+head:
+  name: prototypical
+  score_fn: adaptive_k
+  eval_score_fns:
+    - linear_z3
+    - cosine
+    - sigmoid_z
+    - z_persender_sigmoid
+
+data:
+  processed_dir: data/processed/enron_shortmail
+  train_senders: 100
+  emails_per_sender_k: 8
+  val_split: 0.1
+  test_split: 0.1
+  preprocessing:
+    strip_signatures: false
+    min_body_chars: 20
+    min_body_words: 5
+  augmentation:
+    synthetic_path: null
+    n_syn_per_batch: 0
+    crop_prob: 0.3
+    crop_min_words: 5
+    crop_max_words: 60
+    register_stratified: false
+
+# Shrunk probe (checkpoint-selection only) so 1300 epochs stay cheap. No synthetic
+# pool (synthetics are off); monitor is genuine-vs-other.
+probe:
+  n_profile_senders: 20
+  n_enroll_per_sender: 8
+  n_query_per_sender: 3
+  n_other_queries: 200
+  n_synthetic_queries: 0
+  seed: 0
+
+training:
+  epochs: 1300
+  batch_size: 128
+  lr: 2.0e-4
+  scheduler: cosine
+  warmup_steps: 200
+  grad_clip: 1.0
+  mixed_precision: true
+  monitor: pauc/genuine_vs_other_5pct
+  monitor_mode: max
+  checkpoint_every_n: 1300
+  early_stopping_patience: 0
+  early_stopping_min_delta: 1.0e-3
+  keep_last_n: 1
+  hard_negative_mining:
+    enabled: false
+
+wandb:
+  name: wp-ablate-enron44-nosyn-lora
+  tags:
+    - luar
+    - lora
+    - episodic
+    - whitepaper
+    - ablation
+    - enron44
+    - no-synthetic
+  notes: "Whitepaper 2x2: (44 authors, no synthetics) corner. v14 recipe on Enron-44 to isolate identity-expansion lever (vs v14 844,-syn). ~2600 steps, between v12 and v14."
